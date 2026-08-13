@@ -10,6 +10,49 @@ FLASH_BROWSER_PREFS_FILE="${FLASH_BROWSER_PREFS_FILE:-$HOME/Library/Application 
 FLASH_BROWSER_OPEN_ATTEMPTS="${FLASH_BROWSER_OPEN_ATTEMPTS:-120}"
 FLASH_BROWSER_OPEN_DELAY_SECONDS="${FLASH_BROWSER_OPEN_DELAY_SECONDS:-1}"
 
+update_from_main() {
+  if ! command -v git >/dev/null 2>&1; then
+    echo "Git is not installed or not on PATH; skipping project update."
+    echo
+    return 0
+  fi
+
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "This folder is not a git checkout; skipping project update."
+    echo
+    return 0
+  fi
+
+  local stashed_local_changes="false"
+
+  echo "Saving local account/save changes before updating..."
+  if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+    git stash push --include-untracked -m "dev-mac auto-stash before update $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    stashed_local_changes="true"
+  else
+    echo "No local changes to stash."
+  fi
+
+  echo "Fetching latest main from origin..."
+  git fetch origin main
+
+  if git rev-parse --verify main >/dev/null 2>&1; then
+    git checkout main
+  else
+    git checkout -B main origin/main
+  fi
+
+  echo "Pulling latest game version..."
+  git pull --ff-only origin main
+
+  if [[ "$stashed_local_changes" == "true" ]]; then
+    echo "Restoring local account/save changes..."
+    git stash pop
+  fi
+
+  echo
+}
+
 configure_flashbrowser_homepage() {
   local prefs_file="$1"
   local url="$2"
@@ -144,6 +187,8 @@ trap cleanup_flashbrowser_watcher EXIT
 echo "Dungeon Blitz (local dev server)"
 echo
 
+update_from_main
+
 if ! command -v node >/dev/null 2>&1; then
   echo "ERROR: Node.js is not installed or not on PATH."
   echo "Install Node.js (LTS) then re-run this file."
@@ -214,7 +259,7 @@ fi
 export DISCORD_SOCIAL_APP_ID="1447954255452311695"
 export DISCORD_SOCIAL_DEVICE_FLOW="false"
 
-echo "Starting server + Discord RPC (npm run dev:with-discord)..."
+echo "Starting server + Discord RPC (npm run dev)..."
 echo "Discord channel bridge enabled: $DISCORD_SOCIAL_BRIDGE_ENABLED"
 echo "Discord Social SDK native bridge enabled: $DISCORD_SOCIAL_NATIVE_BRIDGE_ENABLED"
 echo "Discord chat relay mode: $DISCORD_SOCIAL_CHAT_RELAY_MODE"
@@ -226,7 +271,7 @@ echo
 open_flashbrowser_when_ready "$DEV_URL" "$FLASH_BROWSER_APP_NAME" "$FLASH_BROWSER_OPEN_ATTEMPTS" "$FLASH_BROWSER_OPEN_DELAY_SECONDS" &
 FLASH_BROWSER_WATCHER_PID=$!
 set +e
-npm run dev:with-discord
+npm run dev
 EXIT_CODE=$?
 set -e
 

@@ -1,5 +1,7 @@
 import fs from 'fs';
 import path from 'path';
+import { DungeonSpawnLoader } from './DungeonSpawnLoader';
+import { TutorialDungeonMechanics } from '../core/TutorialDungeonMechanics';
 
 export interface NpcDef {
     id: number;
@@ -27,7 +29,24 @@ export class NpcLoader {
     private static levelsRaw: Map<string, NpcDef[]> = new Map();
     private static readonly SERVER_HOSTILE_LEVELS = new Set<string>([
         'GoblinRiverDungeon',
-        'GoblinRiverDungeonHard'
+        'GoblinRiverDungeonHard',
+        'JC_Mini1Hard',
+        'JC_Mini2'
+    ]);
+
+    // A Hard level normally reuses its base level's NPC list because it is the
+    // same geometry at a higher difficulty. TutorialDungeonHard is not: Dread
+    // Goblin Hideout is built from a_Level_GoblinBeachHard, a completely
+    // different room set — which is also why it has no NPCAnna and no Chains03.
+    //
+    // Inheriting anyway planted TutorialDungeon's authored boss (GoblinBoss1,
+    // id 3923550, level position 22695,2959) into the Dread run. Those are the
+    // *normal* dungeon's coordinates, and in the Dread layout they land on top
+    // of room 09's treasure chest — the motionless second Tag Ugo standing by
+    // the chest, never driven, never damaged, never removed. It also counts as
+    // an undefeated required boss, so the run's objectives never complete.
+    private static readonly LEVELS_WITHOUT_BASE_NPC_FALLBACK = new Set<string>([
+        'TutorialDungeonHard'
     ]);
 
     private static normalizeLevelName(levelName: string): string {
@@ -36,7 +55,7 @@ export class NpcLoader {
 
     private static resolveFallbackLevelName(levelName: string): string | null {
         const normalizedLevel = this.normalizeLevelName(levelName);
-        if (!normalizedLevel.endsWith('Hard')) {
+        if (!normalizedLevel.endsWith('Hard') || this.LEVELS_WITHOUT_BASE_NPC_FALLBACK.has(normalizedLevel)) {
             return null;
         }
 
@@ -83,6 +102,18 @@ export class NpcLoader {
         if (levelName === 'TutorialDungeon') {
             const bakedNpcs = new Set(['IntroParrot', 'IntroGoblinNPC', 'NPCAnna']);
             filtered = filtered.filter((npc) => !bakedNpcs.has(String(npc?.name ?? '')));
+            const knownIds = new Set(filtered.map((npc) => Number(npc?.id ?? 0)));
+            for (const npc of npcs) {
+                if (!TutorialDungeonMechanics.isCompletionBoss(levelName, npc)) {
+                    continue;
+                }
+                const id = Number(npc?.id ?? 0);
+                if (knownIds.has(id)) {
+                    continue;
+                }
+                filtered.push(TutorialDungeonMechanics.decorateNpc(levelName, npc));
+                knownIds.add(id);
+            }
         }
 
         return filtered;
@@ -112,6 +143,9 @@ export class NpcLoader {
     }
 
     static load(serverDataDir: string) {
+        this.levelsRaw.clear();
+        this.levelsFiltered.clear();
+
         // serverDataDir is '.../src/server/data' (or similar based on config).
         // New path is directly inside 'src/server/data/npcs'.
         const npcDir = path.join(serverDataDir, 'npcs');
@@ -141,6 +175,26 @@ export class NpcLoader {
                         console.error(`[NpcLoader] Error loading ${file}:`, err);
                     }
                 }
+            }
+            DungeonSpawnLoader.load(serverDataDir);
+            for (const levelName of DungeonSpawnLoader.getLoadedLevelNames()) {
+                const generatedNpcs = DungeonSpawnLoader.getNpcsForLevel(levelName);
+                if (generatedNpcs.length === 0) {
+                    continue;
+                }
+
+                const existingRaw = this.levelsRaw.get(levelName) ?? [];
+                const existingIds = new Set(existingRaw.map((npc) => Math.round(Number(npc.id ?? 0))));
+                const mergedRaw = [
+                    ...existingRaw,
+                    ...generatedNpcs.filter((npc) => !existingIds.has(Math.round(Number(npc.id ?? 0))))
+                ];
+                this.levelsRaw.set(levelName, this.normalizeNpcList(mergedRaw));
+                this.levelsFiltered.set(
+                    levelName,
+                    this.normalizeNpcList(this.filterLevelNpcs(levelName, mergedRaw))
+                );
+                console.log(`[NpcLoader] Merged ${generatedNpcs.length} generated dungeon spawns for ${levelName}.`);
             }
             console.log(`[NpcLoader] Loaded NPCs for ${this.levelsRaw.size} levels.`);
         } catch (e) {

@@ -7,6 +7,81 @@ cd /d "%~dp0"
 echo Dungeon Blitz ^(local dev server^)
 echo.
 
+:: Pull latest main while preserving local account/save edits in a git stash.
+where git >nul 2>nul
+if %errorlevel% neq 0 (
+    echo Git is not installed or not on PATH; skipping project update.
+    echo.
+) else (
+    git rev-parse --is-inside-work-tree >nul 2>nul
+    if !errorlevel! neq 0 (
+        echo This folder is not a git checkout; skipping project update.
+        echo.
+    ) else (
+        echo Saving local account/save changes before updating...
+        set HAS_LOCAL_CHANGES=false
+        set STASHED_LOCAL_CHANGES=false
+        for /f "delims=" %%G in ('git status --porcelain --untracked-files=all') do set HAS_LOCAL_CHANGES=true
+
+        if "!HAS_LOCAL_CHANGES!"=="true" (
+            git stash push --include-untracked -m "dev-windows auto-stash before update %DATE% %TIME%"
+            if !errorlevel! neq 0 (
+                echo.
+                echo ERROR: Could not stash local changes.
+                pause
+                exit /b !errorlevel!
+            )
+            set STASHED_LOCAL_CHANGES=true
+        ) else (
+            echo No local changes to stash.
+        )
+
+        echo Fetching latest main from origin...
+        git fetch origin main
+        if !errorlevel! neq 0 (
+            echo.
+            echo ERROR: Could not fetch origin/main.
+            pause
+            exit /b !errorlevel!
+        )
+
+        git show-ref --verify --quiet refs/heads/main
+        if !errorlevel! equ 0 (
+            git checkout main
+        ) else (
+            git checkout -B main origin/main
+        )
+        if !errorlevel! neq 0 (
+            echo.
+            echo ERROR: Could not switch to main.
+            pause
+            exit /b !errorlevel!
+        )
+
+        echo Pulling latest game version...
+        git pull --ff-only origin main
+        if !errorlevel! neq 0 (
+            echo.
+            echo ERROR: Could not pull latest origin/main.
+            pause
+            exit /b !errorlevel!
+        )
+
+        if "!STASHED_LOCAL_CHANGES!"=="true" (
+            echo Restoring local account/save changes...
+            git stash pop
+            if !errorlevel! neq 0 (
+                echo.
+                echo ERROR: Could not restore stashed local changes.
+                echo Resolve the git conflict, then re-run this file.
+                pause
+                exit /b !errorlevel!
+            )
+        )
+        echo.
+    )
+)
+
 :: Node kontrol
 where node >nul 2>nul
 if %errorlevel% neq 0 (
@@ -131,19 +206,24 @@ if exist "%DISCORD_SOCIAL_BRIDGE_EXECUTABLE%" (
 )
 set DISCORD_SOCIAL_APP_ID=1447954255452311695
 set DISCORD_SOCIAL_DEVICE_FLOW=false
+if not defined STATIC_PORT set "STATIC_PORT=8000"
+if not defined FLASH_SWF_PATH set "FLASH_SWF_PATH=p/cbp/DungeonBlitz.swf"
+if not defined FLASH_FILE_VERSION set "FLASH_FILE_VERSION=cbp"
+if not defined FLASH_GAME_VERSION set "FLASH_GAME_VERSION=cbp"
+if not defined FLASH_BROWSER_URL set "FLASH_BROWSER_URL=http://localhost:%STATIC_PORT%/"
+set "FLASH_PLAYER_URL=!FLASH_BROWSER_URL!!FLASH_SWF_PATH!?fv=!FLASH_FILE_VERSION!^&gv=!FLASH_GAME_VERSION!"
 
 :: SERVER BASLAT
-echo Starting server with Discord RPC ^(npm run dev:discord^)^...
+echo Starting server with Discord RPC ^(npm run dev^)^...
 echo Discord channel bridge enabled: %DISCORD_SOCIAL_BRIDGE_ENABLED%
 echo Discord Social SDK native bridge enabled: %DISCORD_SOCIAL_NATIVE_BRIDGE_ENABLED%
 echo Discord chat relay mode: %DISCORD_SOCIAL_CHAT_RELAY_MODE%
 echo Discord Social SDK app id: %DISCORD_SOCIAL_APP_ID%
 echo Discord Social SDK device flow: %DISCORD_SOCIAL_DEVICE_FLOW%
 echo Discord Social SDK bridge: %DISCORD_SOCIAL_BRIDGE_EXECUTABLE%
-echo When it's ready, open the URL shown in the logs.
 echo.
 
-call npm run dev:discord
+call node tools\runDevDiscordWithUrls.js
 set EXIT_CODE=%errorlevel%
 
 echo.

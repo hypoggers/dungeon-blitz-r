@@ -8,6 +8,10 @@ import { LevelConfig } from './LevelConfig';
 
 type GearDropSource = 'boss' | 'realm';
 
+// Gear tier travels in 2 bits (GearType.const_176), so 3 is the ceiling the wire format allows:
+// 0 Magic, 1 Rare, 2 Legendary, 3 Mystic.
+export const MAX_GEAR_TIER = 3;
+
 interface GearDropRule {
     gearId: number;
     gearName: string;
@@ -20,6 +24,10 @@ interface GearDropContext {
     entName: string;
     realm: string;
     currentLevel?: string | null;
+}
+
+interface DungeonEnemyElementEntry {
+    enemyTypes?: Array<{ enemyType?: string }>;
 }
 
 export class GameData {
@@ -303,7 +311,11 @@ export class GameData {
     }
 
     static buildGearTierKey(gearId: number, tier: number): string {
-        return `${Math.max(0, Math.round(Number(gearId) || 0))}:${Math.max(0, Math.min(2, Math.round(Number(tier) || 0)))}`;
+        return `${Math.max(0, Math.round(Number(gearId) || 0))}:${GameData.clampGearTier(tier)}`;
+    }
+
+    private static clampGearTier(tier: number): number {
+        return Math.max(0, Math.min(MAX_GEAR_TIER, Math.round(Number(tier) || 0)));
     }
 
     private static normalizeGearTier(tier: number | null | undefined): number | null {
@@ -314,7 +326,7 @@ export class GameData {
         if (!Number.isFinite(normalized)) {
             return null;
         }
-        return Math.max(0, Math.min(2, Math.round(normalized)));
+        return GameData.clampGearTier(normalized);
     }
 
     private static loadGearDropRules(dataDir: string): void {
@@ -477,49 +489,74 @@ export class GameData {
         GameData.addDungeonBossEntityKey('JC_Mini2Hard', 'TowerGuard2Hard');
 
         const npcDir = path.join(dataDir, 'npcs');
-        if (!fs.existsSync(npcDir)) {
-            console.warn('[GameData] NPC directory not found; dungeon boss regen will use gear boss locations only.');
-            return;
-        }
-
         let rawNpcBossCount = 0;
-        try {
-            for (const file of fs.readdirSync(npcDir)) {
-                if (!file.endsWith('.json')) {
-                    continue;
-                }
-
-                const levelName = path.basename(file, '.json');
-                const normalizedLevel = LevelConfig.normalizeLevelName(levelName) || levelName;
-                if (!LevelConfig.isDungeonLevel(normalizedLevel)) {
-                    continue;
-                }
-
-                const npcs = readJsonFile<any[]>(path.join(npcDir, file));
-                if (!Array.isArray(npcs)) {
-                    continue;
-                }
-
-                for (const npc of npcs) {
-                    if (Number(npc?.team ?? 0) !== 2) {
-                        continue;
-                    }
-                    const npcName = String(npc?.name ?? '').trim();
-                    if (!npcName || GameData.getEntityRank(npc) !== 'Boss') {
+        if (!fs.existsSync(npcDir)) {
+            console.warn('[GameData] NPC directory not found; dungeon boss regen will use gear and extracted enemy boss locations only.');
+        } else {
+            try {
+                for (const file of fs.readdirSync(npcDir)) {
+                    if (!file.endsWith('.json')) {
                         continue;
                     }
 
-                    GameData.addDungeonBossEntityKey(normalizedLevel, npcName);
-                    rawNpcBossCount += 1;
+                    const levelName = path.basename(file, '.json');
+                    const normalizedLevel = LevelConfig.normalizeLevelName(levelName) || levelName;
+                    if (!LevelConfig.isDungeonLevel(normalizedLevel)) {
+                        continue;
+                    }
+
+                    const npcs = readJsonFile<any[]>(path.join(npcDir, file));
+                    if (!Array.isArray(npcs)) {
+                        continue;
+                    }
+
+                    for (const npc of npcs) {
+                        if (Number(npc?.team ?? 0) !== 2) {
+                            continue;
+                        }
+                        const npcName = String(npc?.name ?? '').trim();
+                        if (!npcName || GameData.getEntityRank(npc) !== 'Boss') {
+                            continue;
+                        }
+
+                        GameData.addDungeonBossEntityKey(normalizedLevel, npcName);
+                        rawNpcBossCount += 1;
+                    }
                 }
+            } catch (err) {
+                console.error('[GameData] Failed to load raw NPC dungeon boss map:', err);
             }
-
-            console.log(
-                `[GameData] Loaded dungeon boss regen map for ${Object.keys(GameData.DUNGEON_BOSS_ENTITY_KEYS_BY_LEVEL).length} dungeons (${rawNpcBossCount} raw NPC boss entries).`
-            );
-        } catch (err) {
-            console.error('[GameData] Failed to load raw NPC dungeon boss map:', err);
         }
+
+        let extractedEnemyBossCount = 0;
+        const dungeonEnemyElementsPath = path.join(dataDir, 'dungeon_enemy_elements.json');
+        if (fs.existsSync(dungeonEnemyElementsPath)) {
+            try {
+                const dungeonEnemyElements = readJsonFile<Record<string, DungeonEnemyElementEntry>>(dungeonEnemyElementsPath);
+                for (const [levelName, entry] of Object.entries(dungeonEnemyElements)) {
+                    const normalizedLevel = LevelConfig.normalizeLevelName(levelName) || levelName;
+                    if (!LevelConfig.isDungeonLevel(normalizedLevel) || !Array.isArray(entry?.enemyTypes)) {
+                        continue;
+                    }
+
+                    for (const enemy of entry.enemyTypes) {
+                        const enemyName = String(enemy?.enemyType ?? '').trim();
+                        if (!enemyName || GameData.getEntityRank({ name: enemyName }) !== 'Boss') {
+                            continue;
+                        }
+
+                        GameData.addDungeonBossEntityKey(normalizedLevel, enemyName);
+                        extractedEnemyBossCount += 1;
+                    }
+                }
+            } catch (err) {
+                console.error('[GameData] Failed to load extracted dungeon enemy boss map:', err);
+            }
+        }
+
+        console.log(
+            `[GameData] Loaded dungeon boss regen map for ${Object.keys(GameData.DUNGEON_BOSS_ENTITY_KEYS_BY_LEVEL).length} dungeons (${rawNpcBossCount} raw NPC boss entries, ${extractedEnemyBossCount} extracted enemy boss entries).`
+        );
     }
 
     private static findClientContentPath(dataDir: string, ...segments: string[]): string | null {
@@ -668,6 +705,17 @@ export class GameData {
         return Boolean(dungeonKey && bossKey && GameData.DUNGEON_BOSS_ENTITY_KEYS_BY_LEVEL[dungeonKey]?.has(bossKey));
     }
 
+    static hasDungeonBossEntities(levelName: string | null | undefined): boolean {
+        const normalizedLevel = LevelConfig.normalizeLevelName(levelName);
+        const levelKnown = Boolean(normalizedLevel && LevelConfig.has(normalizedLevel));
+        if (levelKnown && !LevelConfig.isDungeonLevel(normalizedLevel)) {
+            return false;
+        }
+
+        const dungeonKey = GameData.normalizeDungeonLevelKey(normalizedLevel || levelName);
+        return Boolean(dungeonKey && GameData.DUNGEON_BOSS_ENTITY_KEYS_BY_LEVEL[dungeonKey]?.size);
+    }
+
     static isBossEntity(entity: any): boolean {
         const entityName = String(entity?.name ?? entity?.EntName ?? entity?.entName ?? '').trim();
         const rank = GameData.getEntityRank(entity);
@@ -721,7 +769,7 @@ export class GameData {
         return GameData.DYES.find((dye) => dye.id === dyeId)?.color ?? null;
     }
 
-    static getRandomDyeId(allowedRarities?: Iterable<string>): number {
+    static getRandomDyeId(allowedRarities?: Iterable<string>, excludedDyeIds?: Iterable<number | string>): number {
         if (!Array.isArray(GameData.DYES) || GameData.DYES.length === 0) {
             return 0;
         }
@@ -736,9 +784,22 @@ export class GameData {
             }
         }
 
+        const excluded = new Set<number>();
+        if (excludedDyeIds) {
+            for (const dyeId of excludedDyeIds) {
+                const normalized = Number(dyeId);
+                if (Number.isFinite(normalized) && normalized > 0) {
+                    excluded.add(Math.round(normalized));
+                }
+            }
+        }
+
         const pool = allowed.size > 0
-            ? GameData.DYES.filter((dye) => allowed.has(String(dye.rarity).toUpperCase()))
-            : GameData.DYES;
+            ? GameData.DYES.filter((dye) => allowed.has(String(dye.rarity).toUpperCase()) && !excluded.has(dye.id))
+            : GameData.DYES.filter((dye) => !excluded.has(dye.id));
+        if (pool.length === 0) {
+            return 0;
+        }
         return pool[Math.floor(Math.random() * pool.length)]?.id ?? 0;
     }
 

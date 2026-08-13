@@ -1,12 +1,12 @@
 
 import { Client } from '../core/Client';
-import { DebugLogger } from '../core/Debug';
 import { BuildingID } from '../core/Enums';
 import { BitReader } from '../network/protocol/bitReader';
 import { BitBuffer } from '../network/protocol/bitBuffer';
 import { JsonAdapter } from '../database/JsonAdapter';
 import { WorldEnter } from '../utils/WorldEnter';
 import { isVisitingAnotherPlayersCraftTown } from '../utils/HomeVisitGuard';
+import { SpeedupPricing } from '../core/SpeedupPricing';
 import buildingTypes from '../data/BuildingTypes.json';
 
 const db = new JsonAdapter();
@@ -19,6 +19,10 @@ type BuildingDef = {
     UpgradeTime?: string;
 };
 
+type BuildingUpdateOptions = {
+    includeClassTowers?: boolean;
+};
+
 const buildingDefsByKey = new Map<string, BuildingDef>(
     (buildingTypes as BuildingDef[]).map((entry) => [
         `${Number(entry.BuildingID ?? 0)}:${Number(entry.Rank ?? 0)}`,
@@ -27,17 +31,14 @@ const buildingDefsByKey = new Map<string, BuildingDef>(
 );
 
 export class BuildingHandler {
+    private static readonly MAX_BUILDING_UPGRADE_SECONDS = 4 * 24 * 60 * 60;
     private static readonly CRAFT_TOWN_REFRESH_RETRY_DELAYS_MS = [1200, 2800];
+    private static readonly craftTownRefreshGeneration = new WeakMap<Client, number>();
 
     private static rejectVisitedHomeMutation(client: Client, action: string): boolean {
         if (!isVisitingAnotherPlayersCraftTown(client)) {
             return false;
         }
-
-        DebugLogger.logProgress('HomeVisit:buildingMutationBlocked', client, client.character, {
-            action,
-            host: client.craftTownHostCharacter?.name
-        });
 
         if (client.playerSpawned && client.currentLevel === 'CraftTown') {
             BuildingHandler.sendBuildingUpdate(client);
@@ -65,10 +66,6 @@ export class BuildingHandler {
         }
 
         await BuildingHandler.saveCharacter(client);
-        DebugLogger.logProgress('BuildingCompletion:syncApplied', client, client.character, {
-            buildingId: completed.buildingId,
-            rank: completed.rank
-        });
 
         if (client.playerSpawned && client.currentLevel === 'CraftTown') {
             BuildingHandler.sendBuildingComplete(client, completed.buildingId, completed.rank);
@@ -115,23 +112,42 @@ export class BuildingHandler {
         return buildingDefsByKey.get(`${buildingId}:${rank}`) ?? null;
     }
 
+    private static getUpgradeTimeSeconds(rawUpgradeTime: unknown): number {
+        const seconds = Math.max(0, Math.round(Number(rawUpgradeTime ?? 0)));
+        if (seconds <= 0) {
+            return 0;
+        }
+
+        return Math.min(seconds, BuildingHandler.MAX_BUILDING_UPGRADE_SECONDS);
+    }
+
     static refreshCraftTownBuildingsOnSpawn(client: Client): void {
         if (!client.character || !client.playerSpawned || client.currentLevel !== 'CraftTown') {
             return;
         }
 
+        const refreshGeneration = (BuildingHandler.craftTownRefreshGeneration.get(client) ?? 0) + 1;
+        BuildingHandler.craftTownRefreshGeneration.set(client, refreshGeneration);
+
+        // Class-tower deltas replace their authored display object. Do that exactly
+        // once per Home spawn so nested flame timelines are not torn down again
+        // after they have started playing.
         BuildingHandler.sendBuildingUpdate(client);
-        DebugLogger.logProgress('BuildingRefresh:spawn', client, client.character, {
-            reason: 'crafttown_spawn'
-        });
 
         for (const delayMs of BuildingHandler.CRAFT_TOWN_REFRESH_RETRY_DELAYS_MS) {
             const timer = setTimeout(() => {
-                if (!client.character || !client.playerSpawned || client.currentLevel !== 'CraftTown') {
+                if (
+                    BuildingHandler.craftTownRefreshGeneration.get(client) !== refreshGeneration
+                    || !client.character
+                    || !client.playerSpawned
+                    || client.currentLevel !== 'CraftTown'
+                ) {
                     return;
                 }
 
-                BuildingHandler.sendBuildingUpdate(client);
+                // Keep the reliability retries for non-animated Home buildings,
+                // but never reconstruct a running discipline-tower timeline.
+                BuildingHandler.sendBuildingUpdate(client, { includeClassTowers: false });
             }, delayMs);
             timer.unref?.();
         }
@@ -150,22 +166,10 @@ export class BuildingHandler {
         const usedIdols = br.readMethod15();
 
         console.log(`[Building] Upgrade request: ID=${buildingId}, Rank=${targetRank}, Idols=${usedIdols}`);
-        DebugLogger.logProgress('BuildingUpgrade:request', client, client.character, {
-            buildingId,
-            targetRank,
-            usedIdols
-        });
 
         const statsByBuilding = BuildingHandler.asRecord(client.character.magicForge?.stats_by_building);
         const currentRank = Number(statsByBuilding[buildingId.toString()] ?? statsByBuilding[buildingId] ?? 0);
         if (buildingId > 0 && targetRank > 0 && currentRank >= targetRank) {
-            DebugLogger.logProgress('BuildingUpgrade:ignored', client, client.character, {
-                buildingId,
-                targetRank,
-                currentRank,
-                usedIdols,
-                reason: 'already_at_or_above_target_rank'
-            });
 
             if (client.playerSpawned && client.currentLevel === 'CraftTown') {
                 BuildingHandler.sendBuildingComplete(client, buildingId, currentRank);
@@ -176,44 +180,22 @@ export class BuildingHandler {
 
         const buildingDef = BuildingHandler.getBuildingDef(buildingId, targetRank);
         if (!buildingDef) {
-            DebugLogger.logProgress('BuildingUpgrade:rejected', client, client.character, {
-                buildingId,
-                targetRank,
-                usedIdols,
-                reason: 'missing_building_definition'
-            });
             return;
         }
 
         const goldCost = Math.max(0, Math.round(Number(buildingDef.GoldCost ?? 0)));
         const idolCost = Math.max(0, Math.round(Number(buildingDef.IdolCost ?? 0)));
-        const upgradeTime = Math.max(0, Math.round(Number(buildingDef.UpgradeTime ?? 0)));
+        const upgradeTime = BuildingHandler.getUpgradeTimeSeconds(buildingDef.UpgradeTime);
 
         if (usedIdols) {
             const idols = Number(client.character.mammothIdols ?? 0);
             if (idols < idolCost) {
-                DebugLogger.logProgress('BuildingUpgrade:rejected', client, client.character, {
-                    buildingId,
-                    targetRank,
-                    usedIdols,
-                    idolCost,
-                    idols,
-                    reason: 'not_enough_idols'
-                });
                 return;
             }
             client.character.mammothIdols = idols - idolCost;
         } else {
             const gold = Number(client.character.gold ?? 0);
             if (gold < goldCost) {
-                DebugLogger.logProgress('BuildingUpgrade:rejected', client, client.character, {
-                    buildingId,
-                    targetRank,
-                    usedIdols,
-                    goldCost,
-                    gold,
-                    reason: 'not_enough_gold'
-                });
                 return;
             }
             client.character.gold = gold - goldCost;
@@ -235,13 +217,6 @@ export class BuildingHandler {
 
         // Save
         await BuildingHandler.saveCharacter(client);
-        DebugLogger.logProgress('BuildingUpgrade:queued', client, client.character, {
-            buildingId,
-            targetRank,
-            readyTime,
-            goldCost: usedIdols ? 0 : goldCost,
-            idolCost: usedIdols ? idolCost : 0
-        });
 
         if (usedIdols) {
             BuildingHandler.sendPremiumPurchase(client, 'BuildingUpgrade', idolCost);
@@ -262,18 +237,10 @@ export class BuildingHandler {
         const idolCost = br.readMethod9();
 
         console.log(`[Building] SpeedUp request: Cost=${idolCost}`);
-        DebugLogger.logProgress('BuildingSpeedup:request', client, client.character, {
-            idolCost
-        });
 
         const upgrade = client.character.buildingUpgrade;
         if (!upgrade || !upgrade.buildingID) {
             const existingRank = BuildingHandler.getBuildingRank(client.character, 1);
-            DebugLogger.logProgress('BuildingSpeedup:ignored', client, client.character, {
-                idolCost,
-                reason: 'no_active_building_upgrade',
-                existingTomeRank: existingRank
-            });
 
             if (client.playerSpawned && client.currentLevel === 'CraftTown' && existingRank > 0) {
                 BuildingHandler.sendBuildingComplete(client, 1, existingRank);
@@ -282,13 +249,19 @@ export class BuildingHandler {
             return;
         }
 
-        if (idolCost > 0) {
+        const authoritativeCost = SpeedupPricing.reconcile(upgrade.ReadyTime, idolCost);
+        if (authoritativeCost > 0) {
             const idols = Number(client.character.mammothIdols ?? 0);
-            if (idols < idolCost) {
+            if (idols < authoritativeCost) {
+                console.warn(
+                    `[Building] Refused a Speed Up for ${client.character.name}: ` +
+                    `has ${idols} idols, needs ${authoritativeCost} (client claimed ${idolCost}).`
+                );
+                SpeedupPricing.refreshScreens(client);
                 return;
             }
 
-            client.character.mammothIdols = idols - idolCost;
+            client.character.mammothIdols = idols - authoritativeCost;
         }
 
         // Apply Upgrade Immediately
@@ -304,13 +277,8 @@ export class BuildingHandler {
         client.character.buildingUpgrade = { buildingID: 0, rank: 0, ReadyTime: 0 };
         
         await BuildingHandler.saveCharacter(client);
-        DebugLogger.logProgress('BuildingSpeedup:applied', client, client.character, {
-            idolCost,
-            buildingId,
-            newRank
-        });
 
-        BuildingHandler.sendPremiumPurchase(client, 'BuildingSpeedup', idolCost);
+        BuildingHandler.sendPremiumPurchase(client, 'BuildingSpeedup', authoritativeCost);
 
         // Send Completion Packet (0xD8)
         BuildingHandler.sendBuildingComplete(client, buildingId, newRank);
@@ -340,10 +308,6 @@ export class BuildingHandler {
 
         client.character.buildingUpgrade = { buildingID: 0, rank: 0, ReadyTime: 0 };
         await BuildingHandler.saveCharacter(client);
-        DebugLogger.logProgress('BuildingClaim:applied', client, client.character, {
-            buildingId,
-            rank
-        });
     }
 
     static async handleBuildingCancel(client: Client, _data: Buffer): Promise<void> {
@@ -356,10 +320,6 @@ export class BuildingHandler {
 
         client.character.buildingUpgrade = { buildingID: 0, rank: 0, ReadyTime: 0 };
         await BuildingHandler.saveCharacter(client);
-        DebugLogger.logProgress('BuildingCancel:applied', client, client.character, {
-            buildingId,
-            rank
-        });
 
         if (client.playerSpawned && client.currentLevel === 'CraftTown') {
             BuildingHandler.sendBuildingUpdate(client);
@@ -377,7 +337,7 @@ export class BuildingHandler {
 
     // Ported from WorldEnter.py: send_building_update
     // Packet 0xDA
-    static sendBuildingUpdate(client: Client, overrideRank: number = -1): void {
+    static sendBuildingUpdate(client: Client, options: BuildingUpdateOptions = {}): void {
          if (!client.character) return;
 
          const homeCharacter = client.currentLevel === 'CraftTown' && client.craftTownHostCharacter
@@ -403,7 +363,7 @@ export class BuildingHandler {
             9: BuildingID.NecromancerTower
          };
          const CLASS_TOWER_BUILDINGS: Record<string, number[]> = {
-            paladin: [BuildingID.JusticarTower, BuildingID.SentinelTower, BuildingID.TemplarTower],
+            paladin: [BuildingID.SentinelTower, BuildingID.JusticarTower, BuildingID.TemplarTower],
             mage: [BuildingID.FrostwardenTower, BuildingID.FlameseerTower, BuildingID.NecromancerTower],
             rogue: [BuildingID.ExecutionerTower, BuildingID.ShadowwalkerTower, BuildingID.SoulthiefTower]
          };
@@ -437,7 +397,9 @@ export class BuildingHandler {
          // discipline towers fall back to rank 1 after a relog/House refresh.
          const classTowerIds = CLASS_TOWER_BUILDINGS[String(homeCharacter.class ?? '').toLowerCase()] ?? [towerBuildingId];
          const inactiveClassTowerIds = classTowerIds.filter((buildingId) => buildingId !== towerBuildingId);
-         const bids = Array.from(new Set([2, 12, ...inactiveClassTowerIds, towerBuildingId, 1, 13]));
+         const bids = options.includeClassTowers === false
+            ? [2, 12, 1, 13]
+            : Array.from(new Set([2, 12, ...inactiveClassTowerIds, towerBuildingId, 1, 13]));
          for (const bid of bids) {
              sendDelta(bid, getStat(bid));
          }

@@ -204,9 +204,25 @@
         "PraiseText": "I hate the way those Death Eyes look at me.=Thanks again."
     },
     {
-        "MissionName": "DELETED1",
+        "MissionName": "ClearTheBandits",
         "MissionID": "11",
-        "ZoneSet": "TOBEDELETED"
+        "PreReqMissions": "SeeTheWarden",
+        "ZoneSet": "BridgeTown",
+        "Priority": "Side",
+        "ContactName": "Felguard",
+        "ReturnName": "Felguard",
+        "CompleteCount": "20",
+        "MissionLevel": "11",
+        "ExpReward": "300",
+        "GoldReward": "500",
+        "DisplayName": "Clear the Bandits",
+        "TrackerText": "Defeat 20 human bandits around Felbridge",
+        "TrackerReturn": "Return to Benjaea at the Felbridge bridge",
+        "Description": "Benjaea needs your help to drive the human bandits away from Felbridge. Defeat 20 bandits and return to the bridge guard.",
+        "OfferText": "Hey! Are you the slayer of Aracnaea?=@Yes, I am.=Hero please help me! I am really tired of the bandit problem. Could you kill some of them for me?=@Okey I will do my best for our people.",
+        "ActiveText": "Hey! Are you the slayer of Aracnaea?=@Yes, I am.=Hero please help me! I am really tired of the bandit problem. Could you kill some of them for me?=@Okey I will do my best for our people.",
+        "ReturnText": "Thank you hero. Please accept this little gift. Maybe this could help for your adventure.=@My pleasures. I will help all of you as much as I can. Good luck for guarding the bridge!=Good luck to you, too. May your path be clear, great hero.",
+        "PraiseText": "Thank you hero. Please accept this little gift. Maybe this could help for your adventure.=@My pleasures. I will help all of you as much as I can. Good luck for guarding the bridge!=Good luck to you, too. May your path be clear, great hero."
     },
     {
         "MissionName": "KillGoblins",
@@ -468,6 +484,7 @@
     {
         "MissionName": "SlayMindlessQueen",
         "MissionID": "24",
+        "PreReqMissions": "StopBroodvictor",
         "ZoneSet": "SwampRoadNorth",
         "Priority": "Dungeon",
         "ContactName": "Odem",
@@ -674,7 +691,7 @@
         "DisplayName": "Bandit Problem",
         "TrackerText": "Expel the Bandits from their camp in the woods",
         "TrackerReturn": "Introduce yourself to the Steward of Felbridge",
-        "Description": "The townsfolk shun aoutsiders, who often turn to banditry. To win their trust, you decide to tackle their bandit problem.",
+        "Description": "The townsfolk shun outsiders, who often turn to banditry. To win their trust, you decide to tackle their bandit problem.",
         "PreReqText": "Please go back and get rid of Arachnae",
         "OfferText": "Stranger, I know your type. We've no patience for you here.",
         "ActiveText": "I don't know you, but you'd best be on your way.=@I've come from the King.=@I'm here to help restore the Barony of Ellyria.=Your king has nothing to do with us.=And we've had plenty of bandits say the same story.=I don't want trouble, so go onto the woods with the others.=@There are human bandits in the woods?=Aye, you'll find plenty of your kind there.=@Not my kind.=So you say.=I'll believe it when I see it.",
@@ -2630,6 +2647,7 @@
     {
         "MissionName": "SlayMindlessQueenHard",
         "MissionID": "134",
+        "PreReqMissions": "StopBroodvictorHard",
         "ZoneSet": "SwampRoadNorthHard",
         "Priority": "Dungeon",
         "ContactName": "OdemHard",
@@ -2835,7 +2853,7 @@
         "DisplayName": "Bandit Problem",
         "TrackerText": "Expel the Bandits from their camp in the woods",
         "TrackerReturn": "Introduce yourself to the Steward of Felbridge",
-        "Description": "The townsfolk shun aoutsiders, who often turn to banditry. To win their trust, you decide to tackle their bandit problem.",
+        "Description": "The townsfolk shun outsiders, who often turn to banditry. To win their trust, you decide to tackle their bandit problem.",
         "PreReqText": "Please go back and get rid of Arachnae",
         "OfferText": "Stranger, I know your type. We've no patience for you here.",
         "ActiveText": "I don't know you, but you'd best be on your way.=@I've come from the King.=@I'm here to help restore the Barony of Ellyria.=Your king has nothing to do with us.=And we've had plenty of bandits say the same story.=I don't want trouble, so go onto the woods with the others.=@There are human bandits in the woods?=Aye, you'll find plenty of your kind there.=@Not my kind.=So you say.=I'll believe it when I see it.",

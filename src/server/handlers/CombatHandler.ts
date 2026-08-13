@@ -1,4 +1,7 @@
+import * as fs from 'fs';
+import * as path from 'path';
 import { Client, clearKeepTutorialTimers } from '../core/Client';
+import { DungeonCompletionConditions } from '../core/DungeonCompletionConditions';
 import { BitReader } from '../network/protocol/bitReader';
 import { GlobalState } from '../core/GlobalState';
 import { BitBuffer } from '../network/protocol/bitBuffer';
@@ -10,6 +13,8 @@ import {
 } from '../core/DungeonRunStats';
 import { LevelHandler } from './LevelHandler';
 import { EntityState, EntityTeam } from '../core/Entity';
+import { MasterClassID } from '../core/Enums';
+import { resolveClientXmlDir } from '../utils/ClientXmlDir';
 import { EntityHandler } from './EntityHandler';
 import { MissionHandler } from './MissionHandler';
 import { areClientsInSameParty, getClientCharacterKey, sharesRoomIds, shouldShareCombatView } from '../core/PartySync';
@@ -25,7 +30,14 @@ import { GameData } from '../core/GameData';
 import { CharacterSync } from '../utils/CharacterSync';
 import { sendConsumableUpdate } from '../utils/ConsumableState';
 import { LevelConfig } from '../core/LevelConfig';
-import { isRoomBossEntity } from '../core/RoomBossState';
+import { getRoomBossAwareRoomId, isRoomBossEntity } from '../core/RoomBossState';
+import { adoptBossAuthorityHealth, getBossAuthorityRecord, syncBossAuthorityCopies } from '../core/BossAuthority';
+import { RewardHandler } from './RewardHandler';
+import { MovementAuthority } from '../core/MovementAuthority';
+import { CastRateAuthority } from '../core/CastRateAuthority';
+import { TutorialDungeonMechanics } from '../core/TutorialDungeonMechanics';
+import { LegendsInn } from '../core/LegendsInn';
+import { AdminRuntimeSettings } from '../core/AdminRuntimeSettings';
 
 type CombatRelayOptions = {
     includeAnchor?: boolean;
@@ -75,6 +87,19 @@ type BuffTickDotInfo = {
     tailBits: number;
 };
 
+type ServerAuthorityBuffSnapshot = {
+    key: string;
+    packetId: number;
+    targetId: number;
+    buffId: number;
+    durationMs: number;
+    expiresAt: number;
+    sourceToken: number;
+    sourceName: string;
+    payloadHex: string;
+    updatedAt: number;
+};
+
 type PlayerHitResolution = {
     appliedDamage: number;
     killed: boolean;
@@ -87,7 +112,43 @@ type NpcHitResolution = {
     killed: boolean;
 };
 
+type HostileViewerHealthSnapshot = {
+    localId: number;
+    previousHp: number;
+    previousMaxHp: number;
+};
+
 export class CombatHandler {
+
+    /**
+     * 0xCB -- the client reporting its own mana.
+     *
+     * ActivePower sends this on every cast of a power that authors FromMasterMana with a
+     * non-zero ManaCost: 247 powers do, and the Sentinel Form attacks (SFMelee, SFMeleeCombo,
+     * SFRanged) are the ones a player triggers constantly, so an unhandled 0xCB warned once
+     * per swing. The payload is a single 7-bit value -- PowerType.const_423 -- which is why
+     * the router reported it as 1 byte, and why mana never exceeds 127 in this protocol.
+     *
+     * The server has no mana simulation to reconcile this against, so this records the last
+     * reported value and nothing else. That is deliberately all it does: treating a
+     * client-sent number as authoritative is how a trusted-client exploit gets written, and
+     * the value is only useful for diagnostics until the server actually tracks mana.
+     */
+    static handleClientManaReport(client: Client, data: Buffer): void {
+        if (!client.character) {
+            return;
+        }
+
+        const br = new BitReader(data);
+        if (br.remainingBits() < CombatHandler.CLIENT_MANA_BITS) {
+            return;
+        }
+
+        const reported = Math.max(0, Math.round(Number(br.readMethod20(CombatHandler.CLIENT_MANA_BITS)) || 0));
+        client.lastReportedMana = reported;
+    }
+
+    private static readonly CLIENT_MANA_BITS = 7;
     private static readonly MAX_RELAY_POWER_HIT_DAMAGE = 4_000_000;
     private static readonly FIREBRAND_THIRD_SHOT_POWER_ID = 6144;
     private static readonly FIREBRAND_PIERCING_SHOT_POWER_ID = 6146;
@@ -95,8 +156,88 @@ export class CombatHandler {
     private static readonly FIREBRAND_PIERCING_SHOT_MIN_HIT_RADIUS = 35;
     private static readonly FIREBRAND_PIERCING_HIT_DEDUPE_MS = 1_500;
     private static readonly FIREBRAND_THIRD_SHOT_HIT_DEDUPE_MS = 300;
+    private static readonly SERVER_AUTHORITY_PROXY_HP_DEDUPE_MS = 500;
+    private static readonly PARTY_SHARED_HOSTILE_HP_DEDUPE_MS = 500;
+    private static readonly DEATH_EPSILON_HP = 1;
     private static readonly recentFireBrandThirdShotHits = new Map<string, number>();
     private static readonly recentFireBrandPiercingCasts = new Map<string, number>();
+    private static readonly recentServerAuthorityProxyHpApplies = new Map<string, number>();
+    private static readonly recentPartySharedHostileHpApplies = new Map<string, number>();
+    private static readonly recentTutorialBossHitPackets = new Map<string, number>();
+    private static readonly SERVER_AUTHORITY_SYNC_LEVELS = new Set<string>([
+        'JC_Mini1Hard',
+        'TutorialDungeon'
+    ]);
+
+    static adminDefeatRoomHostiles(anchor: Client, requestedRoomId?: number): { defeated: number; roomId: number } {
+        const levelScope = getClientLevelScope(anchor);
+        const roomId = Number.isFinite(Number(requestedRoomId))
+            ? Math.round(Number(requestedRoomId))
+            : Math.round(Number(anchor.currentRoomId ?? -1));
+        if (!anchor.playerSpawned || !levelScope || roomId < 0) {
+            return { defeated: 0, roomId };
+        }
+
+        const candidates = new Map<number, any>();
+        const collect = (entity: any): void => {
+            const entityId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+            const entityRoomId = getRoomBossAwareRoomId(entity);
+            const dead = Boolean(entity?.dead) || Boolean(entity?.destroyed) ||
+                Number(entity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
+                (Number.isFinite(Number(entity?.hp)) && Number(entity.hp) <= 0);
+            if (
+                entityId > 0 &&
+                entity &&
+                !entity.isPlayer &&
+                Number(entity.team ?? 0) === EntityTeam.ENEMY &&
+                entityRoomId === roomId &&
+                !dead
+            ) {
+                candidates.set(entityId, entity);
+            }
+        };
+
+        for (const entity of GlobalState.levelEntities.get(levelScope)?.values() ?? []) {
+            collect(entity);
+        }
+        for (const entity of anchor.entities.values()) {
+            collect(entity);
+        }
+
+        let defeated = 0;
+        for (const [entityId, entity] of candidates) {
+            const isServerAuthority = CombatHandler.isServerAuthoritySyncNpc(levelScope, entity);
+            CombatHandler.finalizeHostileDeath(anchor, levelScope, entityId, entity, {
+                includeAnchor: true,
+                sendHpCorrection: true,
+                destroyLocal: true,
+                reason: 'admin_room_defeat'
+            });
+
+            if (!isServerAuthority) {
+                for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+                    if (!viewer.playerSpawned || getClientLevelScope(viewer) !== levelScope || viewer.currentRoomId !== roomId) {
+                        continue;
+                    }
+                    const localId = EntityHandler.resolveEntityLocalId(viewer, entityId);
+                    const localEntity = viewer.entities.get(localId) ?? viewer.entities.get(entityId) ?? entity;
+                    const maxHp = Math.max(1, Math.round(Number(localEntity?.maxHp ?? entity?.maxHp ?? entity?.hp ?? 1)) || 1);
+                    viewer.send(0x78, CombatHandler.buildHpDeltaPayload(localId, -maxHp));
+                    viewer.send(0x07, CombatHandler.buildEntityStatePayload(localId, EntityState.DEAD, Boolean(localEntity?.facingLeft)));
+                    viewer.send(0x0D, CombatHandler.buildDestroyEntityPayload(localId, true));
+                    viewer.entities.delete(localId);
+                    viewer.entities.delete(entityId);
+                    viewer.knownEntityIds.delete(localId);
+                    viewer.knownEntityIds.delete(entityId);
+                }
+            }
+
+            CombatHandler.handleEnemyDefeatState(anchor, levelScope, entityId, entity, { fromKillState: true });
+            defeated += 1;
+        }
+
+        return { defeated, roomId };
+    }
 
     private static clampRelayPowerHitDamage(damage: number): number {
         return Math.max(0, Math.min(CombatHandler.MAX_RELAY_POWER_HIT_DAMAGE, Math.round(Number(damage) || 0)));
@@ -168,11 +309,18 @@ export class CombatHandler {
     private static readonly ORIGINAL_REGEN_INTERVAL_MS = 1_000;
     private static readonly DUNGEON_BOSS_OUT_OF_COMBAT_REGEN_DELAY_MS = 500;
     private static readonly DUNGEON_BOSS_REGEN_INTERVAL_MS = CombatHandler.ORIGINAL_REGEN_INTERVAL_MS;
-    private static readonly HOSTILE_REGEN_RATE = 0.01;
+    // A boss whose target died walks its bar back up instead of snapping to
+    // full: 5% of its max HP per regen tick, the same shape the player's own
+    // out-of-combat regen uses. The reset still only ever arms on a confirmed
+    // player death, so a boss can no longer flash from a sliver to 100% in the
+    // single tick that death is observed.
+    private static readonly DUNGEON_BOSS_DEATH_REGEN_RATE = 0.05;
     private static readonly CLIENT_HEAL_PACKET_ID = 0x78;
     private static readonly BOSS_MELEE_AGGRO_RADIUS = 180;
     private static readonly BOSS_RANGED_AGGRO_RADIUS = 260;
     private static readonly KNOWN_ROOM_BOSS_DISPLAY_KEYS_BY_ENTITY = new Map<string, ReadonlySet<string>>([
+        ['defectormage', new Set(['princefriedrichhocke', 'princefredrichhocke'])],
+        ['defectormagehard', new Set(['princefriedrichhocke', 'princefredrichhocke'])],
         ['dreadpaladin', new Set(['dreadpaladinlothyr'])],
         ['dreadpaladin2', new Set(['dreadpaladinlothyr'])],
         ['dreadpaladin3', new Set(['dreadpaladinlothyr'])],
@@ -182,25 +330,9 @@ export class CombatHandler {
     ]);
     private static readonly KNOWN_ROOM_BOSS_DISPLAY_KEYS_BY_LEVEL = new Map<string, ReadonlySet<string>>([
         ['JC_Mission1', new Set(['imperialchampion', 'imperialcommandergrahl'])],
-        ['JC_Mission1Hard', new Set(['imperialchampionhard', 'imperialcommandergrahl', 'imperialcommandergrahlhard'])]
-    ]);
-    private static readonly POWER_HIT_CLIENT_AUTHORITY_BOSS_LEVELS = new Set([
-        'AC_Mission5',
-        'AC_Mission5Hard',
-        'JC_Mission1',
-        'JC_Mission1Hard',
-        'SRN_Mission1',
-        'SRN_Mission1Hard'
-    ]);
-    private static readonly POWER_HIT_CLIENT_AUTHORITY_BOSS_NAMES = new Set([
-        'AncientDragonBlack',
-        'AncientDragonBlackHard',
-        'AncientDragonSilver',
-        'AncientDragonSilverHard',
-        'ImperialChampion',
-        'ImperialChampionHard',
-        'LizardLord',
-        'LizardLordHard'
+        ['JC_Mission1Hard', new Set(['imperialchampionhard', 'imperialcommandergrahl', 'imperialcommandergrahlhard'])],
+        ['JC_Mission3', new Set(['defectormage', 'princefriedrichhocke', 'princefredrichhocke'])],
+        ['JC_Mission3Hard', new Set(['defectormagehard', 'princefriedrichhocke', 'princefredrichhocke'])]
     ]);
     private static readonly HOSTILE_BASE_HITPOINTS = [
         100, 4920, 5580, 6020, 6520, 7040, 7580, 8180, 8800, 9480, 10180, 10960, 11740, 12640, 13540, 14540,
@@ -327,6 +459,23 @@ export class CombatHandler {
         return CombatHandler.PLAYER_HITPOINTS[clampedLevel];
     }
 
+    // The client computes its own max HP (base for the level, times one plus the summed
+    // percentage bonuses from gear, charms and talents -- Entity.as) and reports it via
+    // 0xFC/0xBB. The server has no independent stat model, so it has to trust the number
+    // for legitimate play. What it does not have to do is trust it unbounded: a Cheat
+    // Engine user writing maxHP = 10,000,000 made every server heal, regen and death check
+    // treat them as effectively immortal. The real ceiling is the base times the largest
+    // bonus stack a real character can assemble; 4x (a +300% stack) is well clear of any
+    // legitimate build while turning the god-mode edit into a merely-high, bounded pool.
+    private static readonly MAX_HP_BONUS_MULTIPLE = 4;
+
+    static clampDeclaredMaxHp(client: Client, declaredMaxHp: number): number {
+        const level = Number(client.character?.level ?? 1);
+        const ceiling = CombatHandler.getBaseHpForLevel(level) * CombatHandler.MAX_HP_BONUS_MULTIPLE;
+        const declared = Math.max(1, Math.round(Number(declaredMaxHp) || 0));
+        return Math.min(declared, Math.round(ceiling));
+    }
+
     private static getRespawnHealAmount(client: Client): number {
         const entity = client.clientEntID > 0 ? client.entities.get(client.clientEntID) : null;
         const levelEntity = client.clientEntID > 0
@@ -349,11 +498,36 @@ export class CombatHandler {
         client.sendBitBuffer(0x80, bb);
     }
 
+    // A death almost never has stats synced within the last second, so the deferred
+    // path below is the normal path for every revive -- not an edge case. Waiting on
+    // the client's 0xFC without a deadline is what leaves a player permanently dead
+    // when that reply never lands (dropped under a deep packet queue, a client busy
+    // loading a level, or an unpatched client that stays quiet while dead).
+    private static readonly RESPAWN_COMBAT_STATS_TIMEOUT_MS = 2_500;
+
     private static deferRespawnResponseForCombatStats(client: Client, usePotion: boolean, nowMs: number): void {
         client.pendingRespawnRequest = { usePotion, requestedAt: nowMs };
         client.combatStatsDirty = true;
         client.allowDirtyCombatStatsRegen = false;
         client.lastCombatStatsRefreshRequestAt = nowMs;
+
+        if (client.pendingRespawnTimer) {
+            clearTimeout(client.pendingRespawnTimer);
+        }
+        client.pendingRespawnTimer = setTimeout(() => {
+            client.pendingRespawnTimer = null;
+            if (!client.pendingRespawnRequest) {
+                return;
+            }
+            // resolvePlayerMaxHp falls back to the character level's base HP, so an
+            // answer built from stale stats still revives the player at a sane pool.
+            console.warn(
+                `[Combat] Combat stats never arrived for respawn; reviving ${client.character?.name ?? 'unknown'} on the timeout path.`
+            );
+            CombatHandler.completePendingRespawnAfterCombatStats(client);
+        }, CombatHandler.RESPAWN_COMBAT_STATS_TIMEOUT_MS);
+        client.pendingRespawnTimer.unref?.();
+
         CharacterSync.requestCombatStatsRefresh(client);
     }
 
@@ -364,6 +538,10 @@ export class CombatHandler {
         }
 
         client.pendingRespawnRequest = null;
+        if (client.pendingRespawnTimer) {
+            clearTimeout(client.pendingRespawnTimer);
+            client.pendingRespawnTimer = null;
+        }
         CombatHandler.sendRespawnResponse(client, pending.usePotion);
     }
 
@@ -508,67 +686,63 @@ export class CombatHandler {
         client.send(CombatHandler.CLIENT_HEAL_PACKET_ID, CombatHandler.buildCharRegenPayload(entityId, amount));
     }
 
-    private static logPlayerHp(
-        label: string,
+    private static isTerminalHostileEntity(entity: any): boolean {
+        const hp = Number(entity?.hp ?? NaN);
+        const hasPositiveHp = Number.isFinite(hp) && Math.round(hp) > 0;
+        return Boolean(entity) &&
+            !Boolean(entity?.isPlayer) &&
+            Number(entity?.team ?? 0) === EntityTeam.ENEMY &&
+            (
+                Boolean(entity?.destroyed) ||
+                (Number.isFinite(hp) && Math.round(hp) <= 0) ||
+                (!hasPositiveHp && (
+                    Boolean(entity?.dead) ||
+                    Number(entity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD
+                ))
+            );
+    }
+
+    private static sendPostDeathSourceCorrection(
         client: Client,
-        details: Record<string, unknown>,
-        throttleMs: number = 0,
-        nowMs: number = Date.now()
+        levelScope: string,
+        canonicalEntity: any,
+        rawLocalId: number,
+        kind: string
     ): void {
-        const reason = String(details.reason ?? '');
-        const key = `${client.token}:${client.clientEntID}:${label}:${reason}`;
-        if (throttleMs > 0) {
-            const previousAt = Math.max(0, Number(CombatHandler.recentPlayerHpLogs.get(key) ?? 0));
-            if (nowMs - previousAt < throttleMs) {
-                return;
-            }
-            CombatHandler.recentPlayerHpLogs.set(key, nowMs);
+        const canonicalId = Math.max(0, Math.round(Number(canonicalEntity?.id ?? 0)));
+        const localId = Math.max(0, Math.round(Number(rawLocalId) || 0));
+        if (canonicalId <= 0 || localId <= 0) {
+            return;
         }
 
-        const characterName = String(client.character?.name ?? 'unknown').replace(/\s+/g, '_');
-        const levelScope = getClientLevelScope(client) || 'none';
-        const formattedDetails = Object.entries(details)
-            .map(([detailKey, value]) => `${detailKey}=${String(value)}`)
-            .join(' ');
-        console.log(
-            `[CombatRegen][${label}] player=${characterName} token=${client.token} ent=${client.clientEntID} level=${levelScope} ${formattedDetails}`
+        CombatHandler.sendHostileDeathCorrectionToViewer(
+            client,
+            levelScope,
+            canonicalEntity,
+            localId,
+            'dead_hostile_still_firing'
         );
     }
 
-    private static logBossRegen(
-        label: string,
-        levelScope: string,
-        entity: any,
-        details: Record<string, unknown> = {},
-        throttleMs: number = CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS,
-        nowMs: number = Date.now()
-    ): void {
-        const entityId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
-        const reason = String(details.reason ?? '');
-        const key = `${levelScope}:${entityId}:${label}:${reason}`;
-        if (throttleMs > 0) {
-            const previousAt = Math.max(0, Number(CombatHandler.recentBossRegenLogs.get(key) ?? 0));
-            if (nowMs - previousAt < throttleMs) {
-                return;
-            }
-            CombatHandler.recentBossRegenLogs.set(key, nowMs);
+    private static incrementHostileHpVersion(entity: any): number {
+        if (!entity || typeof entity !== 'object') {
+            return 0;
         }
 
-        const entityName = String(entity?.name ?? entity?.EntName ?? entity?.entName ?? 'unknown').replace(/\s+/g, '_');
-        const displayName = String(
-            entity?.roomBossName ??
-            entity?.displayName ??
-            entity?.DisplayName ??
-            entity?.characterName ??
-            entity?.character_name ??
-            ''
-        ).replace(/\s+/g, '_');
-        const formattedDetails = Object.entries(details)
-            .map(([detailKey, value]) => `${detailKey}=${String(value)}`)
-            .join(' ');
-        console.log(
-            `[CombatRegen][${label}] level=${levelScope || 'none'} boss=${entityName} display=${displayName || 'none'} ent=${entityId} ${formattedDetails}`
-        );
+        entity.hpVersion = Math.max(0, Math.round(Number(entity.hpVersion ?? 0))) + 1;
+        return entity.hpVersion;
+    }
+
+    private static isCanonicalHostileTerminal(levelScope: string, entity: any): boolean {
+        if (!entity || typeof entity !== 'object') {
+            return false;
+        }
+
+        return Boolean(entity.dead) ||
+            Boolean(entity.destroyed) ||
+            Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
+            Math.round(Number(entity.hp ?? 1)) <= 0 ||
+            Boolean(EntityHandler.findDeadServerAuthorityHostileTombstone(levelScope, entity));
     }
 
     private static buildHpDeltaPayload(entityId: number, delta: number): Buffer {
@@ -694,12 +868,19 @@ export class CombatHandler {
     }
 
     private static isPlayerSessionDead(client: Client): boolean {
+        const localEntity = client.entities.get(client.clientEntID);
+        const levelEntity = CombatHandler.resolveLevelEntity(getClientLevelScope(client), client.clientEntID);
+        if (
+            CombatHandler.isEntityActiveWithPositiveHp(localEntity) ||
+            CombatHandler.isEntityActiveWithPositiveHp(levelEntity)
+        ) {
+            return false;
+        }
+
         if (Math.round(Number(client.authoritativeCurrentHp ?? 1)) <= 0) {
             return true;
         }
 
-        const localEntity = client.entities.get(client.clientEntID);
-        const levelEntity = CombatHandler.resolveLevelEntity(getClientLevelScope(client), client.clientEntID);
         return CombatHandler.isEntityDead(localEntity) ||
             CombatHandler.isEntityDead(levelEntity);
     }
@@ -711,7 +892,7 @@ export class CombatHandler {
             return false;
         }
 
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!session.playerSpawned || getClientLevelScope(session) !== levelScope) {
                 continue;
             }
@@ -737,16 +918,28 @@ export class CombatHandler {
     }
 
     private static hasLivingPlayerInHostileRoom(levelScope: string, entity: any): boolean {
-        const sourceRoomId = Number.isFinite(Number(entity?.roomId)) ? Math.round(Number(entity.roomId)) : -1;
-        for (const session of GlobalState.sessionsByToken.values()) {
-            if (!session.playerSpawned || getClientLevelScope(session) !== levelScope) {
-                continue;
-            }
-            if (sourceRoomId >= 0 && !sharesRoomIds(session.currentRoomId, sourceRoomId)) {
+        const sourceRoomId = getRoomBossAwareRoomId(entity);
+        const roomSessions = sourceRoomId >= 0
+            ? GlobalState.getSessionsInRoom(levelScope, sourceRoomId)
+            : GlobalState.getSessionsInLevelScope(levelScope);
+        for (const session of roomSessions) {
+            if (!session.playerSpawned) {
                 continue;
             }
             if (!CombatHandler.isPlayerSessionDead(session)) {
                 return true;
+            }
+        }
+
+        if (sourceRoomId >= 0) {
+            for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
+                if (
+                    session.playerSpawned &&
+                    Number(session.currentRoomId) < 0 &&
+                    !CombatHandler.isPlayerSessionDead(session)
+                ) {
+                    return true;
+                }
             }
         }
 
@@ -767,7 +960,9 @@ export class CombatHandler {
     }
 
     private static isEntityDead(entity: any): boolean {
-        return Boolean(entity?.dead) || Number(entity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
+        return Boolean(entity?.dead) ||
+            Boolean(entity?.destroyed) ||
+            Number(entity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
     }
 
     private static isEntityActiveWithPositiveHp(entity: any): boolean {
@@ -792,17 +987,24 @@ export class CombatHandler {
             return false;
         }
 
-        const authoritativeHp = Number(client.authoritativeCurrentHp ?? NaN);
-        if (Number.isFinite(authoritativeHp) && Math.round(authoritativeHp) <= 0) {
-            return true;
-        }
-
         const localEntity = typeof client.entities?.get === 'function'
             ? client.entities.get(entityId)
             : null;
         const levelEntity = levelScope
             ? CombatHandler.resolveLevelEntity(levelScope, entityId)
             : null;
+        if (
+            CombatHandler.isEntityActiveWithPositiveHp(localEntity) ||
+            CombatHandler.isEntityActiveWithPositiveHp(levelEntity)
+        ) {
+            return false;
+        }
+
+        const authoritativeHp = Number(client.authoritativeCurrentHp ?? NaN);
+        if (Number.isFinite(authoritativeHp) && Math.round(authoritativeHp) <= 0) {
+            return true;
+        }
+
         return CombatHandler.isEntityDead(localEntity) || CombatHandler.isEntityDead(levelEntity);
     }
 
@@ -862,7 +1064,14 @@ export class CombatHandler {
             : CombatHandler.BOSS_MELEE_AGGRO_RADIUS;
     }
 
-    private static estimateHostileMaxHp(entity: any): number {
+    // BossAuthority sizes a boss pool once, on first sight, and owns it from
+    // then on. It needs the same EntTypes arithmetic every other health path
+    // uses, but must not import the handler back — hence this seam.
+    static estimateHostileMaxHpForBossAuthority(entity: any, levelNameOrScope: string = ''): number {
+        return CombatHandler.estimateHostileMaxHp(entity, levelNameOrScope);
+    }
+
+    private static estimateHostileMaxHp(entity: any, levelNameOrScope: string = ''): number {
         const entType = GameData.getEntType(String(entity?.name ?? '')) ?? {};
         const rawLevel = Number(entity?.level ?? entType?.Level ?? entType?.baseLevel ?? entType?.ExpLevel ?? 1);
         const hitPointScale = Number(entity?.HitPoints ?? entity?.hitPoints ?? entType?.HitPoints ?? NaN);
@@ -870,7 +1079,55 @@ export class CombatHandler {
             return 0;
         }
 
-        return Math.max(1, Math.round(CombatHandler.getHostileBaseHpForLevel(rawLevel) * hitPointScale));
+        const tier = LevelConfig.getHostileHpTier(
+            getScopeLevelName(String(levelNameOrScope ?? '')),
+            rawLevel,
+            Number(entType?.Level ?? entType?.baseLevel ?? entType?.ExpLevel ?? 0)
+        );
+
+        return Math.max(1, Math.round(
+            CombatHandler.getHostileBaseHpForLevel(tier) * hitPointScale
+        ));
+    }
+
+    // A client-spawned hostile never tells the server its real health pool — the
+    // patched client reports damage deltas only — so the server derives the pool
+    // from EntTypes. Counting reported damage against that derived number and
+    // calling the boss dead when the total reaches it is how the rank screen
+    // opened while a Dread boss was still standing: the derived pool is a
+    // fraction of what the boss actually has on screen. When the pool we are
+    // counting against is our own estimate, the arithmetic proves nothing and
+    // the client's defeat signal has to commit the kill instead.
+    private static hasDerivedHostileHealthPool(levelScope: string, entity: any, maxHp: number): boolean {
+        const estimatedMaxHp = CombatHandler.estimateHostileMaxHp(entity, levelScope);
+        return estimatedMaxHp > 0 && Math.round(Number(maxHp) || 0) === estimatedMaxHp;
+    }
+
+    // A boss that stalls here would never finish its dungeon, so make the
+    // deferral visible rather than silent.
+    private static logDeferredDerivedPoolBossKill(
+        levelScope: string,
+        entity: any,
+        healthState: { maxHp: number; currentHp: number },
+        totalReportedDamage: number
+    ): void {
+        const entityId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const lastLoggedAt = Math.max(0, Number(entity?.derivedPoolDeferralLoggedAt ?? 0));
+        const nowMs = Date.now();
+        if (nowMs - lastLoggedAt < CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS) {
+            return;
+        }
+        if (entity && typeof entity === 'object') {
+            entity.derivedPoolDeferralLoggedAt = nowMs;
+        }
+
+        console.log('[CombatHandler] Deferred required boss kill: health pool is a server estimate', {
+            scope: levelScope,
+            entityId,
+            name: String(entity?.name ?? ''),
+            derivedMaxHp: healthState.maxHp,
+            totalReportedDamage
+        });
     }
 
     private static getNpcHealthDelta(entity: any): number {
@@ -881,12 +1138,15 @@ export class CombatHandler {
         return deltas.length > 0 ? Math.min(...deltas) : 0;
     }
 
-    private static getNpcHealthState(entity: any): { maxHp: number; currentHp: number; authoritativeKill: boolean } | null {
+    private static getNpcHealthState(
+        entity: any,
+        levelNameOrScope: string = ''
+    ): { maxHp: number; currentHp: number; authoritativeKill: boolean } | null {
         if (!entity || entity.isPlayer) {
             return null;
         }
         if (EntityHandler.isHomeDummyEntity(entity)) {
-            const maxHp = Math.max(1, CombatHandler.estimateHostileMaxHp(entity));
+            const maxHp = Math.max(1, CombatHandler.estimateHostileMaxHp(entity, levelNameOrScope));
             return {
                 maxHp,
                 currentHp: maxHp,
@@ -896,7 +1156,7 @@ export class CombatHandler {
 
         const explicitMaxHp = Math.max(0, Math.round(Number(entity.maxHp ?? 0)));
         const rawHp = Number(entity.hp ?? NaN);
-        const estimatedMaxHp = CombatHandler.estimateHostileMaxHp(entity);
+        const estimatedMaxHp = CombatHandler.estimateHostileMaxHp(entity, levelNameOrScope);
         const maxHp = explicitMaxHp > 0
             ? explicitMaxHp
             : estimatedMaxHp > 0
@@ -958,6 +1218,42 @@ export class CombatHandler {
         const candidateId = Math.max(0, Math.round(Number(candidate.id ?? 0)));
         if (sourceId > 0 && sourceId === candidateId) {
             return true;
+        }
+
+        const levelName = getScopeLevelName(levelScope);
+        const sourceObjectiveRole = DungeonCompletionConditions.getObjectiveRole(levelName, sourceEntity);
+        const candidateObjectiveRole = DungeonCompletionConditions.getObjectiveRole(levelName, candidate);
+        if (sourceObjectiveRole || candidateObjectiveRole) {
+            if (!sourceObjectiveRole || sourceObjectiveRole !== candidateObjectiveRole) {
+                return false;
+            }
+            const sourceSpawnKey = String(
+                sourceEntity?.spawnKey ?? EntityHandler.getHostileSpawnKey(levelScope, sourceEntity)
+            );
+            const candidateSpawnKey = String(
+                candidate?.spawnKey ?? EntityHandler.getHostileSpawnKey(levelScope, candidate)
+            );
+            return Boolean(sourceSpawnKey && candidateSpawnKey && sourceSpawnKey === candidateSpawnKey);
+        }
+
+        const sourceRequiredBoss = DungeonCompletionConditions.getCanonicalBossName(
+            levelName,
+            sourceEntity,
+            levelScope
+        );
+        const candidateRequiredBoss = DungeonCompletionConditions.getCanonicalBossName(
+            levelName,
+            candidate,
+            levelScope
+        );
+        // Scripted multi-boss encounters can give distinct bosses the same display name.
+        if (
+            sourceRequiredBoss &&
+            candidateRequiredBoss &&
+            CombatHandler.normalizeCombatLookupKey(sourceRequiredBoss) !==
+                CombatHandler.normalizeCombatLookupKey(candidateRequiredBoss)
+        ) {
+            return false;
         }
 
         const sourceRoomId = Math.round(Number(sourceEntity.roomId ?? -1));
@@ -1043,7 +1339,6 @@ export class CombatHandler {
         if (localEntity && (Boolean(localEntity?.isPlayer) || Number(localEntity?.team ?? 0) !== EntityTeam.ENEMY)) {
             return localId;
         }
-
         const explicitCanonicalId = Math.max(
             0,
             Math.round(Number(localEntity?.canonicalEntityId ?? localEntity?.sharedCanonicalId ?? 0))
@@ -1060,19 +1355,38 @@ export class CombatHandler {
             return canonicalId;
         }
 
+        const localEntityName = String(
+            localEntity?.name ??
+            localEntity?.EntName ??
+            localEntity?.entName ??
+            ''
+        )
+            .trim()
+            .toLowerCase();
+
+        if (
+            getScopeLevelName(levelScope) === 'SD_Mission4' &&
+            (
+                localEntityName === 'oasisvizierred' ||
+                localEntityName === 'oasisviziergreen' ||
+                localEntityName === 'oasisvizieryellow' 
+            )
+        ) {
+            return localId;
+        }
+
         const roomBoss = CombatHandler.findSingleRoomBossForUnknownClientHostile(client, levelScope);
         const roomBossId = Math.max(0, Math.round(Number(roomBoss?.id ?? 0)));
         if (roomBossId > 0) {
             EntityHandler.rememberEntityAlias(client, localId, roomBossId);
-            CombatHandler.logBossRegen('boss-hp-report-alias', levelScope, roomBoss, {
-                rawEntityId: localId,
-                entityId: roomBossId,
-                reason: 'single-room-boss'
-            }, 0);
             return roomBossId;
         }
 
         return localId;
+    }
+
+    static resolveClientHostileAliasForSharedState(client: Client, levelScope: string, entityId: number): number {
+        return CombatHandler.resolveClientHostileEntityAlias(client, levelScope, entityId);
     }
 
     private static findSingleRoomBossForUnknownClientHostile(client: Client, levelScope: string): any | null {
@@ -1100,7 +1414,7 @@ export class CombatHandler {
                 continue;
             }
 
-            const entityRoomId = Math.round(Number(entity?.roomId ?? -1));
+            const entityRoomId = getRoomBossAwareRoomId(entity);
             if (clientRoomId >= 0 && entityRoomId >= 0 && !sharesRoomIds(clientRoomId, entityRoomId)) {
                 continue;
             }
@@ -1142,7 +1456,7 @@ export class CombatHandler {
 
         add(entity);
         add(GlobalState.levelEntities.get(levelScope)?.get(entityId));
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (getClientLevelScope(session) !== levelScope) {
                 continue;
             }
@@ -1175,7 +1489,7 @@ export class CombatHandler {
             return false;
         }
 
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (CombatHandler.isSessionPresentForHostileRegen(session, levelScope)) {
                 return true;
             }
@@ -1197,8 +1511,23 @@ export class CombatHandler {
     }
 
     private static isHostileDefeatVerified(levelScope: string, entity: any): boolean {
+        const explicitHp = Number(entity?.hp);
+        if (
+            CombatHandler.isEntityDead(entity) ||
+            (Number.isFinite(explicitHp) && Math.round(explicitHp) <= 0)
+        ) {
+            return true;
+        }
+
         return CombatHandler.collectHostileHealthCopies(levelScope, entity, true)
-            .some((copy) => Boolean(copy?.clientDefeatVerified));
+            .some((copy) =>
+                Boolean(copy?.clientDefeatVerified) ||
+                Boolean(copy?.destroyed) ||
+                Boolean(copy?.bossDeathCommitted) ||
+                Boolean(copy?.bossRespawnBlocked) ||
+                Boolean(copy?.questDefeatProcessed) ||
+                Math.max(0, Math.round(Number(copy?.deathFinalizedAt ?? 0))) > 0
+            );
     }
 
     private static getDeadPlayerForHostileDeathRegen(levelScope: string, entity: any): Client | null {
@@ -1207,7 +1536,7 @@ export class CombatHandler {
             return null;
         }
 
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!session?.character || getClientLevelScope(session) !== levelScope) {
                 continue;
             }
@@ -1257,10 +1586,10 @@ export class CombatHandler {
             entity,
             CombatHandler.isDungeonBossEntity(levelScope, entity)
         )
-            .map((copy) => CombatHandler.getNpcHealthState(copy))
+            .map((copy) => CombatHandler.getNpcHealthState(copy, levelScope))
             .filter((state): state is { maxHp: number; currentHp: number; authoritativeKill: boolean } => Boolean(state));
         if (states.length <= 0) {
-            return CombatHandler.getNpcHealthState(entity);
+            return CombatHandler.getNpcHealthState(entity, levelScope);
         }
 
         const maxHp = Math.max(...states.map((state) => state.maxHp), 1);
@@ -1302,19 +1631,177 @@ export class CombatHandler {
         return normalizedHp;
     }
 
-    private static shouldDeferPowerHitKillToClient(levelScope: string, entity: any): boolean {
-        const levelName = getScopeLevelName(levelScope);
+    private static assignPartySharedHostileCombatAuthority(levelScope: string, entity: any, authority: Client | null): void {
         if (
-            !levelName ||
-            !CombatHandler.POWER_HIT_CLIENT_AUTHORITY_BOSS_LEVELS.has(levelName) ||
-            !Boolean(entity?.clientSpawned)
+            !levelScope ||
+            !entity ||
+            typeof entity !== 'object' ||
+            !authority?.playerSpawned ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return;
+        }
+
+        const existingToken = Math.max(
+            0,
+            Math.round(Number(entity.combatAuthorityToken ?? entity.firstCombatAuthorityToken ?? 0) || 0)
+        );
+        const authorityToken = existingToken > 0 ? existingToken : Math.max(0, Math.round(Number(authority.token) || 0));
+        if (authorityToken <= 0) {
+            return;
+        }
+
+        const authoritySession = GlobalState.sessionsByToken.get(authorityToken) ?? authority;
+        const authorityName = String(authoritySession.character?.name ?? entity.combatAuthorityName ?? entity.firstCombatAuthorityName ?? '');
+        const startedAt = Math.max(
+            1,
+            Math.round(Number(entity.combatAuthorityStartedAt ?? entity.firstCombatAuthorityStartedAt ?? Date.now()) || Date.now())
+        );
+
+        const apply = (copy: any): void => {
+            if (!copy || typeof copy !== 'object' || Boolean(copy.isPlayer) || Number(copy.team ?? 0) !== EntityTeam.ENEMY) {
+                return;
+            }
+            copy.combatAuthorityToken = authorityToken;
+            copy.firstCombatAuthorityToken = authorityToken;
+            copy.combatAuthorityName = authorityName;
+            copy.firstCombatAuthorityName = authorityName;
+            copy.combatAuthorityStartedAt = startedAt;
+            copy.firstCombatAuthorityStartedAt = startedAt;
+        };
+
+        apply(entity);
+        for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, entity, true)) {
+            apply(copy);
+        }
+    }
+
+    private static getPartySharedHostileCombatAuthorityToken(levelScope: string, entity: any): number {
+        if (
+            !levelScope ||
+            !entity ||
+            typeof entity !== 'object' ||
+            Boolean(entity.isPlayer) ||
+            Number(entity.team ?? 0) !== EntityTeam.ENEMY ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return 0;
+        }
+
+        return Math.max(
+            0,
+            Math.round(Number(entity.combatAuthorityToken ?? entity.firstCombatAuthorityToken ?? 0) || 0)
+        );
+    }
+
+    private static getPartySharedHostileAiAuthorityToken(levelScope: string, entity: any): number {
+        if (
+            !levelScope ||
+            !entity ||
+            typeof entity !== 'object' ||
+            Boolean(entity.isPlayer) ||
+            Number(entity.team ?? 0) !== EntityTeam.ENEMY ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return 0;
+        }
+
+        return Math.max(
+            0,
+            Math.round(Number(entity.aiOwnerToken ?? entity.ownerToken ?? entity.proxyOwnerToken ?? 0) || 0)
+        );
+    }
+
+    private static shouldSuppressNonAuthorityPartySharedHostileAction(
+        client: Client,
+        levelScope: string,
+        entity: any
+    ): boolean {
+        const aiAuthorityToken = CombatHandler.getPartySharedHostileAiAuthorityToken(levelScope, entity);
+        const authorityToken = aiAuthorityToken > 0
+            ? aiAuthorityToken
+            : CombatHandler.getPartySharedHostileCombatAuthorityToken(levelScope, entity);
+        const suppress = authorityToken > 0 && authorityToken !== client.token;
+        if (suppress) {
+        }
+        return suppress;
+    }
+
+    private static isDeadPartySharedHostile(levelScope: string, entity: any): boolean {
+        if (
+            !levelScope ||
+            !entity ||
+            Boolean(entity.isPlayer) ||
+            Number(entity.team ?? 0) !== EntityTeam.ENEMY ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
         ) {
             return false;
         }
 
-        const entityName = String(entity?.name ?? entity?.EntName ?? entity?.entName ?? '').trim();
-        return CombatHandler.POWER_HIT_CLIENT_AUTHORITY_BOSS_NAMES.has(entityName) ||
-            CombatHandler.isKnownClientRoomBossEntity(levelName, entity);
+        return CombatHandler.isEntityDead(entity) || Math.round(Number(entity.hp ?? 0)) <= 0;
+    }
+
+    private static shouldSuppressDeadPartySharedHostileAction(
+        client: Client,
+        levelScope: string,
+        sourceEntity: any,
+        reason: string
+    ): boolean {
+        if (!CombatHandler.isDeadPartySharedHostile(levelScope, sourceEntity)) {
+            return false;
+        }
+
+        const canonicalId = Math.max(0, Math.round(Number(sourceEntity?.id ?? 0)));
+        if (canonicalId > 0) {
+            CombatHandler.relayPartyLocalEntityDefeat(
+                client,
+                levelScope,
+                canonicalId,
+                sourceEntity,
+                { requireKnownOrLocal: false, sendHpCorrection: false, includeAnchor: true }
+            );
+        }
+        return true;
+    }
+
+    private static shouldDeferPowerHitKillToClient(levelScope: string, entity: any): boolean {
+        const levelName = getScopeLevelName(levelScope);
+        return Boolean(
+            levelName &&
+            (
+                (
+                    DungeonCompletionConditions.requiresBossDefeatSignal(levelName) &&
+                    DungeonCompletionConditions.isRequiredBoss(levelName, entity, levelScope)
+                ) ||
+                // The same reasoning as the HP-report path: a required boss whose
+                // health pool is only the server's EntTypes estimate must not be
+                // killed by server-side damage arithmetic. One power hit already
+                // exceeds that estimate many times over, so the rank screen opened
+                // with the boss still on screen at a fraction of its real bar.
+                (
+                    // A server-authority level authors its own hostiles, so its
+                    // health pool is authoritative and killing one server-side is
+                    // correct. Everywhere else the pool is only an EntTypes
+                    // estimate of what the client actually shows.
+                    !EntityHandler.usesServerAuthorityHostiles(levelName) &&
+                    DungeonCompletionConditions.isRequiredBoss(levelName, entity, levelScope) &&
+                    CombatHandler.hasDerivedHostileHealthPool(
+                        levelScope,
+                        entity,
+                        // An unset pool is derived by definition: the health state
+                        // falls back to the estimate for it.
+                        Math.max(0, Math.round(Number(entity?.maxHp ?? 0))) ||
+                            CombatHandler.estimateHostileMaxHp(entity, levelScope)
+                    )
+                ) ||
+                DungeonCompletionConditions.isClientAuthorityBoss(levelName, entity, levelScope) ||
+                (
+                    Boolean(entity?.clientSpawned) &&
+                    DungeonCompletionConditions.isRequiredBoss(levelName, entity, levelScope) &&
+                    CombatHandler.isKnownClientRoomBossEntity(levelName, entity)
+                )
+            )
+        );
     }
 
     private static noteCombatInteraction(levelScope: string, sourceId: number, targetId: number, fallbackClient: Client, atMs: number = Date.now()): void {
@@ -1325,7 +1812,7 @@ export class CombatHandler {
         const sourceEntity = CombatHandler.resolveLevelEntity(levelScope, sourceId);
         const targetEntity = CombatHandler.resolveLevelEntity(levelScope, targetId);
         const sourceSession = CombatHandler.resolveCombatSourceSession(levelScope, sourceId, fallbackClient);
-        const targetSession = CombatHandler.findPlayerSessionByEntityId(targetId);
+        const targetSession = CombatHandler.findPlayerSessionByEntityId(levelScope, targetId);
         const hostileSource = sourceEntity && !sourceEntity.isPlayer && Number(sourceEntity.team ?? 0) === EntityTeam.ENEMY
             ? sourceEntity
             : null;
@@ -1354,13 +1841,6 @@ export class CombatHandler {
             return;
         }
         if (CombatHandler.shouldDeferPlayerRegenForCombatStats(client, nowMs)) {
-            CombatHandler.logPlayerHp('regen-skip', client, {
-                reason: 'combat-stats-dirty',
-                authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-                authMax: Math.round(Number(client.authoritativeMaxHp ?? 0)),
-                lastCombatAt: Math.max(0, client.lastCombatActivityAt),
-                lastTickAt: Math.max(0, client.lastCombatRegenTickAt)
-            }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
@@ -1368,13 +1848,6 @@ export class CombatHandler {
             CombatHandler.resolveLevelEntity(levelScope, client.clientEntID);
         const levelEntity = CombatHandler.resolveLevelEntity(levelScope, client.clientEntID);
         if (CombatHandler.isEntityDead(entity) || CombatHandler.isEntityDead(levelEntity)) {
-            CombatHandler.logPlayerHp('regen-skip', client, {
-                reason: 'dead',
-                entityHp: Math.round(Number(entity?.hp ?? 0)),
-                levelHp: Math.round(Number(levelEntity?.hp ?? 0)),
-                authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-                authMax: Math.round(Number(client.authoritativeMaxHp ?? 0))
-            }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
@@ -1382,15 +1855,6 @@ export class CombatHandler {
         const currentHp = CombatHandler.resolvePlayerCurrentHp(client, entity, levelEntity, maxHp);
         if (currentHp <= 0 || currentHp >= maxHp) {
             if (currentHp < maxHp) {
-                CombatHandler.logPlayerHp('regen-skip', client, {
-                    reason: 'invalid-hp',
-                    currentHp,
-                    maxHp,
-                    entityHp: Math.round(Number(entity?.hp ?? 0)),
-                    levelHp: Math.round(Number(levelEntity?.hp ?? 0)),
-                    authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-                    authMax: Math.round(Number(client.authoritativeMaxHp ?? 0))
-                }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS, nowMs);
             }
             return;
         }
@@ -1398,15 +1862,6 @@ export class CombatHandler {
         if (Math.max(0, client.lastCombatActivityAt) <= 0) {
             client.lastCombatActivityAt = Math.max(0, nowMs - CombatHandler.PLAYER_OUT_OF_COMBAT_REGEN_DELAY_MS);
             client.lastCombatRegenTickAt = 0;
-            CombatHandler.logPlayerHp('regen-seed', client, {
-                currentHp,
-                maxHp,
-                entityHp: Math.round(Number(entity?.hp ?? 0)),
-                levelHp: Math.round(Number(levelEntity?.hp ?? 0)),
-                authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-                authMax: Math.round(Number(client.authoritativeMaxHp ?? 0)),
-                lastCombatAt: client.lastCombatActivityAt
-            }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
@@ -1418,16 +1873,6 @@ export class CombatHandler {
             CombatHandler.PLAYER_OUT_OF_COMBAT_REGEN_INTERVAL_MS
         );
         if (!regenState) {
-            CombatHandler.logPlayerHp('regen-wait', client, {
-                currentHp,
-                maxHp,
-                lastCombatAt: Math.max(0, client.lastCombatActivityAt),
-                lastTickAt: Math.max(0, client.lastCombatRegenTickAt),
-                dueAt: Math.max(0, client.lastCombatRegenTickAt) > 0
-                    ? Math.max(0, client.lastCombatRegenTickAt) + CombatHandler.PLAYER_OUT_OF_COMBAT_REGEN_INTERVAL_MS
-                    : Math.max(0, client.lastCombatActivityAt) + CombatHandler.PLAYER_OUT_OF_COMBAT_REGEN_DELAY_MS,
-                nowMs
-            }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
@@ -1464,15 +1909,6 @@ export class CombatHandler {
         const payload = CombatHandler.buildCharRegenPayload(client.clientEntID, healAmount);
         client.send(CombatHandler.CLIENT_HEAL_PACKET_ID, payload);
         CombatHandler.broadcastToSameLevel(levelScope, CombatHandler.CLIENT_HEAL_PACKET_ID, payload, [client.clientEntID], client);
-        CombatHandler.logPlayerHp('regen-heal', client, {
-            previousHp: currentHp,
-            healAmount,
-            nextHp,
-            maxHp,
-            ticks: regenState.ticks,
-            lastCombatAt: Math.max(0, client.lastCombatActivityAt),
-            lastTickAt: Math.max(0, client.lastCombatRegenTickAt)
-        }, 0, nowMs);
     }
 
     private static processHostileOutOfCombatRegen(levelScope: string, entity: any, nowMs: number): void {
@@ -1489,75 +1925,33 @@ export class CombatHandler {
         const deadDeathRegenPlayer = deathRegenArmed
             ? CombatHandler.getDeadPlayerForHostileDeathRegen(levelScope, entity)
             : null;
-        const zeroHpOrDead = Boolean(healthState) &&
-            (CombatHandler.isEntityDead(entity) || healthState!.currentHp <= 0);
-        const verifiedDefeat = deathRegenArmed &&
-            CombatHandler.isHostileDefeatVerified(levelScope, entity);
+        const verifiedDefeat = CombatHandler.isHostileDefeatVerified(levelScope, entity);
         if (
             !healthState ||
-            healthState.currentHp >= healthState.maxHp ||
-            (zeroHpOrDead && (!deadDeathRegenPlayer || verifiedDefeat))
+            verifiedDefeat ||
+            healthState.currentHp >= healthState.maxHp
         ) {
-            CombatHandler.logBossRegen('boss-regen-skip', levelScope, entity, {
-                reason: !healthState
-                    ? 'no-health'
-                    : healthState.currentHp >= healthState.maxHp
-                        ? 'full'
-                        : verifiedDefeat
-                            ? 'verified-dead'
-                            : 'dead',
-                currentHp: healthState?.currentHp ?? 0,
-                maxHp: healthState?.maxHp ?? 0,
-                entityHp: Math.round(Number(entity?.hp ?? 0)),
-                healthDelta: CombatHandler.getNpcHealthDelta(entity),
-                roomId: Math.round(Number(entity?.roomId ?? -1))
-            }, CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS, nowMs);
+            if (verifiedDefeat && deathRegenArmed) {
+                CombatHandler.clearHostileDeathRegenArm(levelScope, entity, deathRegenArmKey);
+            }
             return;
         }
 
         if (deathRegenArmed && !deadDeathRegenPlayer) {
             CombatHandler.clearHostileDeathRegenArm(levelScope, entity, deathRegenArmKey);
-            CombatHandler.logBossRegen('boss-regen-skip', levelScope, entity, {
-                reason: 'death-player-alive',
-                currentHp: healthState.currentHp,
-                maxHp: healthState.maxHp,
-                healthDelta: CombatHandler.getNpcHealthDelta(entity),
-                roomId: Math.round(Number(entity?.roomId ?? -1))
-            }, 0, nowMs);
             return;
         }
 
         if (CombatHandler.hasLivingHostileAggroTarget(levelScope, entity)) {
-            CombatHandler.logBossRegen('boss-regen-skip', levelScope, entity, {
-                reason: 'living-aggro-target',
-                currentHp: healthState.currentHp,
-                maxHp: healthState.maxHp,
-                aggroTargetEntityId: Math.round(Number(entity?.aggroTargetEntityId ?? 0)),
-                aggroTargetToken: Math.round(Number(entity?.aggroTargetToken ?? 0))
-            }, CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
         if (CombatHandler.hasLivePlayerInBossAggro(levelScope, entity)) {
             CombatHandler.noteHostileCombatActivity(entity, nowMs);
-            CombatHandler.logBossRegen('boss-regen-skip', levelScope, entity, {
-                reason: 'live-player-aggro',
-                currentHp: healthState.currentHp,
-                maxHp: healthState.maxHp,
-                aggroTargetEntityId: Math.round(Number(entity?.aggroTargetEntityId ?? 0)),
-                aggroTargetToken: Math.round(Number(entity?.aggroTargetToken ?? 0))
-            }, CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
         if (!deathRegenArmed) {
-            CombatHandler.logBossRegen('boss-regen-skip', levelScope, entity, {
-                reason: 'death-not-armed',
-                currentHp: healthState.currentHp,
-                maxHp: healthState.maxHp,
-                healthDelta: CombatHandler.getNpcHealthDelta(entity),
-                roomId: Math.round(Number(entity?.roomId ?? -1))
-            }, CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
@@ -1569,24 +1963,25 @@ export class CombatHandler {
             CombatHandler.DUNGEON_BOSS_REGEN_INTERVAL_MS
         );
         if (!regenState) {
-            CombatHandler.logBossRegen('boss-regen-wait', levelScope, entity, {
-                currentHp: healthState.currentHp,
-                maxHp: healthState.maxHp,
-                lastCombatAt: CombatHandler.getEntityCombatActivityAt(entity),
-                lastTickAt: CombatHandler.getEntityLastRegenTickAt(entity),
-                dueAt: CombatHandler.getEntityLastRegenTickAt(entity) > 0
-                    ? CombatHandler.getEntityLastRegenTickAt(entity) + CombatHandler.DUNGEON_BOSS_REGEN_INTERVAL_MS
-                    : CombatHandler.getEntityCombatActivityAt(entity) + CombatHandler.DUNGEON_BOSS_OUT_OF_COMBAT_REGEN_DELAY_MS,
-                nowMs
-            }, CombatHandler.BOSS_REGEN_LOG_THROTTLE_MS, nowMs);
             return;
         }
 
-        const healPerTick = Math.max(1, Math.round(CombatHandler.HOSTILE_REGEN_RATE * healthState.maxHp));
-        const requestedHeal = Math.min(healthState.maxHp - healthState.currentHp, healPerTick * regenState.ticks);
+        // A boss reset is a lifecycle boundary, not ordinary periodic healing.
+        // Only a confirmed player death arms this reset; range or temporary
+        // disengagement must not refill a living boss during an attempt. The
+        // restore itself is paced over the ticks the arm survives rather than
+        // applied in one jump, so the encounter visibly heals back up while its
+        // killer is down instead of blinking to full.
+        const healPerTick = Math.max(1, Math.round(healthState.maxHp * CombatHandler.DUNGEON_BOSS_DEATH_REGEN_RATE));
+        const requestedHeal = Math.min(
+            healthState.maxHp - healthState.currentHp,
+            healPerTick * regenState.ticks
+        );
         if (requestedHeal <= 0) {
             return;
         }
+
+        CombatHandler.returnHostileToRoomBossHome(levelScope, entity);
 
         const nextHp = CombatHandler.applyNpcHealthState(
             entity,
@@ -1599,6 +1994,7 @@ export class CombatHandler {
             return;
         }
 
+        CombatHandler.resetClientReportedBossDamage(levelScope, entity);
         CombatHandler.setEntityLastRegenTickAt(
             entity,
             regenState.baseTickAt + ((regenState.ticks - 1) * CombatHandler.DUNGEON_BOSS_REGEN_INTERVAL_MS)
@@ -1607,14 +2003,6 @@ export class CombatHandler {
 
         const payload = CombatHandler.buildCharRegenPayload(Number(entity.id ?? 0), actualHeal);
         const viewers = CombatHandler.broadcastHostileRegenPacket(levelScope, entity, payload);
-        CombatHandler.logBossRegen('boss-regen-heal', levelScope, entity, {
-            previousHp: healthState.currentHp,
-            healAmount: actualHeal,
-            nextHp,
-            maxHp: healthState.maxHp,
-            ticks: regenState.ticks,
-            viewers
-        }, 0, nowMs);
     }
 
     private static broadcastHostileRegenPacket(levelScope: string, entity: any, payload: Buffer): number {
@@ -1628,8 +2016,8 @@ export class CombatHandler {
         }
 
         let viewers = 0;
-        const sourceRoomId = Number.isFinite(Number(entity?.roomId)) ? Number(entity.roomId) : -1;
-        for (const viewer of GlobalState.sessionsByToken.values()) {
+        const sourceRoomId = getRoomBossAwareRoomId(entity);
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!CombatHandler.isSessionPresentForHostileRegen(viewer, levelScope)) {
                 continue;
             }
@@ -1647,11 +2035,9 @@ export class CombatHandler {
                 continue;
             }
 
-            viewer.send(
-                CombatHandler.CLIENT_HEAL_PACKET_ID,
-                CombatHandler.translateOutboundPacketForViewer(viewer, CombatHandler.CLIENT_HEAL_PACKET_ID, payload)
-            );
-            viewers++;
+            if (CombatHandler.sendTranslatedPacket(viewer, CombatHandler.CLIENT_HEAL_PACKET_ID, payload)) {
+                viewers++;
+            }
         }
 
         return viewers;
@@ -1663,7 +2049,12 @@ export class CombatHandler {
             return;
         }
 
-        const healthDelta = currentHp - maxHp;
+        const normalizedMaxHp = Math.max(1, Math.round(Number(maxHp) || 1));
+        const normalizedCurrentHp = Math.max(0, Math.min(normalizedMaxHp, Math.round(Number(currentHp) || 0)));
+        const healthDelta = normalizedCurrentHp - normalizedMaxHp;
+        const shouldSyncEquivalentCopies =
+            CombatHandler.isDungeonBossEntity(levelScope, sourceEntity) ||
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), sourceEntity);
         const apply = (entity: any): void => {
             if (
                 !entity ||
@@ -1676,27 +2067,71 @@ export class CombatHandler {
             ) {
                 return;
             }
-            entity.maxHp = maxHp;
-            entity.hp = currentHp;
+            entity.maxHp = normalizedMaxHp;
+            entity.hp = normalizedCurrentHp;
             entity.healthDelta = healthDelta;
             entity.health_delta = healthDelta;
-            if (currentHp > 0 && Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+            entity.hpVersion = Math.max(
+                Math.max(0, Math.round(Number(entity.hpVersion ?? 0))),
+                Math.max(0, Math.round(Number(sourceEntity.hpVersion ?? 0)))
+            );
+            if (sourceEntity.combatAuthorityToken || sourceEntity.firstCombatAuthorityToken) {
+                entity.combatAuthorityToken = sourceEntity.combatAuthorityToken ?? sourceEntity.firstCombatAuthorityToken;
+                entity.firstCombatAuthorityToken = sourceEntity.firstCombatAuthorityToken ?? sourceEntity.combatAuthorityToken;
+                entity.combatAuthorityName = sourceEntity.combatAuthorityName ?? sourceEntity.firstCombatAuthorityName;
+                entity.firstCombatAuthorityName = sourceEntity.firstCombatAuthorityName ?? sourceEntity.combatAuthorityName;
+                entity.combatAuthorityStartedAt = sourceEntity.combatAuthorityStartedAt ?? sourceEntity.firstCombatAuthorityStartedAt;
+                entity.firstCombatAuthorityStartedAt = sourceEntity.firstCombatAuthorityStartedAt ?? sourceEntity.combatAuthorityStartedAt;
+            }
+            if (normalizedCurrentHp <= 0) {
+                entity.entState = EntityState.DEAD;
+                entity.dead = true;
+            } else if (Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
                 entity.entState = EntityState.ACTIVE;
+                entity.dead = false;
+            } else if (Boolean(entity.dead)) {
                 entity.dead = false;
             }
         };
 
         apply(GlobalState.levelEntities.get(levelScope)?.get(entityId));
-        if (CombatHandler.isDungeonBossEntity(levelScope, sourceEntity)) {
+        if (shouldSyncEquivalentCopies) {
             for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, sourceEntity, true)) {
                 apply(copy);
             }
+            CombatHandler.publishBossAuthorityHealth(levelScope, sourceEntity, normalizedCurrentHp, normalizedMaxHp);
+            return;
         }
-        for (const session of GlobalState.sessionsByToken.values()) {
+
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (getClientLevelScope(session) !== levelScope) {
                 continue;
             }
             apply(session.entities.get(entityId));
+        }
+        CombatHandler.publishBossAuthorityHealth(levelScope, sourceEntity, normalizedCurrentHp, normalizedMaxHp);
+    }
+
+    // The copy sweep above matches siblings heuristically, by name and position.
+    // A boss is matched by identity instead, so a copy the heuristic misses —
+    // one spawned at a different position, or by a client that entered later —
+    // still learns the run's scaling and, once it happens, the death.
+    private static publishBossAuthorityHealth(
+        levelScope: string,
+        sourceEntity: any,
+        currentHp: number,
+        maxHp: number
+    ): void {
+        const record = adoptBossAuthorityHealth(levelScope, sourceEntity, currentHp, maxHp);
+        if (record) {
+            syncBossAuthorityCopies(levelScope, record);
+        }
+    }
+
+    private static resetClientReportedBossDamage(levelScope: string, sourceEntity: any): void {
+        for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, sourceEntity, true)) {
+            copy.clientReportedDamageLifeNonce = Math.max(0, Math.round(Number(copy.lifeNonce ?? 0)));
+            copy.clientReportedDamageByToken = new Map<number, number>();
         }
     }
 
@@ -1732,7 +2167,7 @@ export class CombatHandler {
             }
         }
 
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!CombatHandler.isSessionPresentForHostileRegen(session, levelScope)) {
                 continue;
             }
@@ -1749,7 +2184,7 @@ export class CombatHandler {
             return;
         }
 
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!session.playerSpawned || getClientLevelScope(session) !== levelScope) {
                 continue;
             }
@@ -1814,12 +2249,116 @@ export class CombatHandler {
         return bb.toBuffer();
     }
 
-    private static translateEntityIdForViewer(viewer: Client, entityId: number): number {
-        return EntityHandler.resolveEntityLocalId(viewer, entityId);
+    private static getBufferBit(data: Buffer, bitIndex: number): number {
+        const byteIndex = Math.floor(bitIndex / 8);
+        const bitOffset = bitIndex & 7;
+        return (data[byteIndex] >> (7 - bitOffset)) & 1;
     }
 
-    private static translateOutboundPacketForViewer(viewer: Client, packetId: number, data: Buffer): Buffer {
+    private static packBits(bits: number[]): Buffer {
+        while (bits.length % 8 !== 0) {
+            bits.push(0);
+        }
+
+        const out = Buffer.alloc(bits.length / 8);
+        for (let i = 0; i < bits.length; i += 8) {
+            let byte = 0;
+            for (let j = 0; j < 8; j++) {
+                byte = (byte << 1) | (bits[i + j] & 1);
+            }
+            out[i / 8] = byte;
+        }
+        return out;
+    }
+
+    private static encodeMethod9Bits(value: number): number[] {
+        const normalized = Math.max(0, Math.round(Number(value) || 0));
+        let bitLen = normalized > 0 ? Math.floor(Math.log2(normalized)) + 1 : 1;
+        if (bitLen % 2 !== 0) {
+            bitLen += 1;
+        }
+        const prefix = (bitLen / 2) - 1;
+        const bits: number[] = [];
+        for (let i = 3; i >= 0; i--) {
+            bits.push((prefix >> i) & 1);
+        }
+        for (let i = bitLen - 1; i >= 0; i--) {
+            bits.push((normalized >> i) & 1);
+        }
+        return bits;
+    }
+
+    private static leadingMethod9BitLength(data: Buffer): number {
+        if (!data.length) {
+            return 0;
+        }
+
+        const prefix = (CombatHandler.getBufferBit(data, 0) << 3) |
+            (CombatHandler.getBufferBit(data, 1) << 2) |
+            (CombatHandler.getBufferBit(data, 2) << 1) |
+            CombatHandler.getBufferBit(data, 3);
+        return 4 + ((prefix + 1) * 2);
+    }
+
+    private static replaceLeadingMethod9(data: Buffer, nextValue: number): Buffer {
+        const skipBits = CombatHandler.leadingMethod9BitLength(data);
+        if (skipBits <= 0 || skipBits > data.length * 8) {
+            return data;
+        }
+
+        const bits = CombatHandler.encodeMethod9Bits(nextValue);
+        for (let i = skipBits; i < data.length * 8; i++) {
+            bits.push(CombatHandler.getBufferBit(data, i));
+        }
+        return CombatHandler.packBits(bits);
+    }
+
+    private static trailingBitsAfterLeadingMethod9Hex(data: Buffer): string {
+        const skipBits = CombatHandler.leadingMethod9BitLength(data);
+        if (skipBits <= 0 || skipBits >= data.length * 8) {
+            return '';
+        }
+
+        const bits: number[] = [];
+        for (let i = skipBits; i < data.length * 8; i++) {
+            bits.push(CombatHandler.getBufferBit(data, i));
+        }
+        return CombatHandler.packBits(bits).toString('hex');
+    }
+
+    private static parseBuffTargetEntityId(data: Buffer): number {
         try {
+            return new BitReader(data).readMethod9();
+        } catch {
+            return 0;
+        }
+    }
+
+    private static packetLabel(packetId: number): string {
+        return `0x${packetId.toString(16).toUpperCase().padStart(2, '0')}`;
+    }
+
+    private static translateEntityIdForViewer(viewer: Client, packetId: number, entityId: number): number | null {
+        const levelScope = getClientLevelScope(viewer);
+        const canonicalId = Math.max(0, Math.round(Number(entityId) || 0));
+        const resolution = EntityHandler.resolveHostileLocalIdForViewer(
+            viewer,
+            levelScope,
+            canonicalId,
+            CombatHandler.packetLabel(packetId)
+        );
+        if (!resolution.ok) {
+            return null;
+        }
+        if (resolution.entity && resolution.localId !== canonicalId) {
+        } else if (resolution.entity && resolution.localId === canonicalId) {
+        }
+        return resolution.localId;
+    }
+
+    private static translateOutboundPacketForViewer(viewer: Client, packetId: number, data: Buffer): Buffer | null {
+        try {
+            
             switch (packetId) {
                 case 0x09: {
                     const info = CombatHandler.parsePowerCastRelayInfo(data);
@@ -1827,7 +2366,10 @@ export class CombatHandler {
                         return data;
                     }
 
-                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, info.sourceId);
+                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, packetId, info.sourceId);
+                    if (sourceId === null) {
+                        return null;
+                    }
                     if (sourceId === info.sourceId) {
                         return data;
                     }
@@ -1843,8 +2385,11 @@ export class CombatHandler {
                         return data;
                     }
 
-                    const targetId = CombatHandler.translateEntityIdForViewer(viewer, info.targetId);
-                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, info.sourceId);
+                    const targetId = CombatHandler.translateEntityIdForViewer(viewer, packetId, info.targetId);
+                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, packetId, info.sourceId);
+                    if (targetId === null || sourceId === null) {
+                        return null;
+                    }
                     if (targetId === info.targetId && sourceId === info.sourceId) {
                         return data;
                     }
@@ -1861,8 +2406,11 @@ export class CombatHandler {
                         return data;
                     }
 
-                    const targetId = CombatHandler.translateEntityIdForViewer(viewer, info.targetId);
-                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, info.sourceId);
+                    const targetId = CombatHandler.translateEntityIdForViewer(viewer, packetId, info.targetId);
+                    const sourceId = CombatHandler.translateEntityIdForViewer(viewer, packetId, info.sourceId);
+                    if (targetId === null || sourceId === null) {
+                        return null;
+                    }
                     if (targetId === info.targetId && sourceId === info.sourceId) {
                         return data;
                     }
@@ -1873,10 +2421,26 @@ export class CombatHandler {
                         sourceId
                     });
                 }
+                case 0x0B:
+                case 0x0C: {
+                    const entityId = CombatHandler.parseBuffTargetEntityId(data);
+                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, packetId, entityId);
+                    if (localEntityId === null) {
+                        return null;
+                    }
+                    if (entityId <= 0 || localEntityId === entityId) {
+                        return data;
+                    }
+
+                    return CombatHandler.replaceLeadingMethod9(data, localEntityId);
+                }
                 case 0x07: {
                     const br = new BitReader(data);
                     const entityId = br.readMethod4();
-                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, entityId);
+                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, packetId, entityId);
+                    if (localEntityId === null) {
+                        return null;
+                    }
                     if (localEntityId === entityId) {
                         return data;
                     }
@@ -1898,7 +2462,10 @@ export class CombatHandler {
                 case 0x0D: {
                     const br = new BitReader(data);
                     const entityId = br.readMethod4();
-                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, entityId);
+                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, packetId, entityId);
+                    if (localEntityId === null) {
+                        return null;
+                    }
                     if (localEntityId === entityId) {
                         return data;
                     }
@@ -1909,7 +2476,10 @@ export class CombatHandler {
                 case 0x78: {
                     const br = new BitReader(data);
                     const entityId = br.readMethod4();
-                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, entityId);
+                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, packetId, entityId);
+                    if (localEntityId === null) {
+                        return null;
+                    }
                     if (localEntityId === entityId) {
                         return data;
                     }
@@ -1919,7 +2489,10 @@ export class CombatHandler {
                 case 0x82: {
                     const br = new BitReader(data);
                     const entityId = br.readMethod9();
-                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, entityId);
+                    const localEntityId = CombatHandler.translateEntityIdForViewer(viewer, packetId, entityId);
+                    if (localEntityId === null) {
+                        return null;
+                    }
                     if (localEntityId === entityId) {
                         return data;
                     }
@@ -1935,6 +2508,15 @@ export class CombatHandler {
         } catch {
             return data;
         }
+    }
+
+    private static sendTranslatedPacket(viewer: Client, packetId: number, data: Buffer): boolean {
+        const translated = CombatHandler.translateOutboundPacketForViewer(viewer, packetId, data);
+        if (!translated) {
+            return false;
+        }
+        viewer.send(packetId, translated);
+        return true;
     }
 
     private static resolveClientEntityAliases(client: Client, info: PowerHitRelayInfo): PowerHitRelayInfo {
@@ -2012,7 +2594,7 @@ export class CombatHandler {
         };
 
         apply(GlobalState.levelEntities.get(levelScope)?.get(entityId));
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (getClientLevelScope(session) === levelScope) {
                 apply(session.entities.get(entityId));
             }
@@ -2052,6 +2634,15 @@ export class CombatHandler {
                 continue;
             }
 
+            if (CombatHandler.isHostileDefeatVerified(levelScope, entity)) {
+                CombatHandler.clearHostileDeathRegenArm(
+                    levelScope,
+                    entity,
+                    CombatHandler.getHostileDeathRegenArmKey(entity)
+                );
+                continue;
+            }
+
             const alreadyArmedForThisDeath = String(entity.deathRegenArmedForPlayerKey ?? '') === deathRegenArmKey;
             CombatHandler.clearHostileAggroTargetForPlayer(entity, client);
             CombatHandler.returnHostileToRoomBossHome(levelScope, entity);
@@ -2064,22 +2655,6 @@ export class CombatHandler {
                 CombatHandler.setEntityLastRegenTickAt(entity, 0);
             }
             armedBossCount++;
-            CombatHandler.logBossRegen('boss-regen-arm', levelScope, entity, {
-                player: String(client.character?.name ?? 'unknown').replace(/\s+/g, '_'),
-                playerToken: client.token,
-                playerEnt: client.clientEntID,
-                alreadyArmed: alreadyArmedForThisDeath,
-                currentHp: Math.round(Number(entity?.hp ?? 0)),
-                maxHp: Math.round(Number(entity?.maxHp ?? 0)),
-                healthDelta: CombatHandler.getNpcHealthDelta(entity),
-                roomId: Math.round(Number(entity?.roomId ?? -1))
-            }, 0, nowMs);
-        }
-
-        if (armedBossCount <= 0) {
-            console.log(
-                `[CombatRegen][boss-regen-arm-none] player=${String(client.character?.name ?? 'unknown').replace(/\s+/g, '_')} token=${client.token} ent=${client.clientEntID} level=${levelScope}`
-            );
         }
 
         for (const entity of CombatHandler.collectHostileRegenCandidates(levelScope)) {
@@ -2117,6 +2692,60 @@ export class CombatHandler {
         CombatHandler.armBossRegenForPlayerDeath(client, nowMs, !wasAlreadyDead || !deathRegenWasArmed);
     }
 
+    static notePlayerActiveMovementState(
+        client: Client,
+        nowMs: number = Date.now(),
+        allowStaleDeadEntityRepair: boolean = false
+    ): void {
+        if (!client.character || client.clientEntID <= 0) {
+            return;
+        }
+
+        const levelScope = getClientLevelScope(client);
+        const localEntity = client.entities.get(client.clientEntID);
+        const levelEntity = CombatHandler.resolveLevelEntity(levelScope, client.clientEntID);
+        if (
+            !allowStaleDeadEntityRepair &&
+            (
+                CombatHandler.isEntityDead(localEntity) ||
+                CombatHandler.isEntityDead(levelEntity)
+            )
+        ) {
+            return;
+        }
+
+        const maxHp = Math.max(
+            1,
+            Math.round(Number(client.authoritativeMaxHp ?? 0)),
+            Math.round(Number(localEntity?.maxHp ?? 0)),
+            Math.round(Number(levelEntity?.maxHp ?? 0))
+        );
+        const hpCandidates = [
+            client.authoritativeCurrentHp,
+            localEntity?.hp,
+            levelEntity?.hp
+        ]
+            .map((value) => Math.round(Number(value ?? 0)))
+            .filter((value) => Number.isFinite(value) && value > 0);
+        const nextHp = Math.max(1, Math.min(maxHp, Math.max(1, ...hpCandidates)));
+
+        for (const entity of new Set([localEntity, levelEntity])) {
+            if (!entity || typeof entity !== 'object') {
+                continue;
+            }
+            entity.maxHp = Math.max(maxHp, Math.round(Number(entity.maxHp ?? 0)) || 0);
+            entity.hp = Math.max(1, Math.round(Number(entity.hp ?? 0)) || nextHp);
+            entity.dead = false;
+            if (Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                entity.entState = EntityState.ACTIVE;
+            }
+        }
+
+        client.authoritativeMaxHp = maxHp;
+        client.authoritativeCurrentHp = Math.max(1, Math.min(maxHp, nextHp));
+        CombatHandler.clearEnemyDeathRegenArm(client);
+    }
+
     private static clearEnemyDeathRegenArm(client: Client): void {
         client.enemyDeathRegenArmed = false;
         const levelScope = getClientLevelScope(client);
@@ -2130,31 +2759,8 @@ export class CombatHandler {
         }
     }
 
-    private static clearLevelEnemyRewardTrackingForRespawn(client: Client): void {
-        if (!client.currentLevel) {
-            return;
-        }
-
-        const levelScope = getClientLevelScope(client);
-        const levelMap = GlobalState.levelEntities.get(levelScope);
-        if (!levelMap) {
-            return;
-        }
-
-        for (const [entityId, entity] of levelMap.entries()) {
-            if (entityId <= 0 || EntityHandler.isClientOwnPlayerEntity(client, levelScope, entityId, entity)) {
-                continue;
-            }
-            if (Boolean(entity?.isPlayer) || Number(entity?.team ?? 0) !== 2) {
-                continue;
-            }
-
-            CombatHandler.clearEntityRewardTracking(levelScope, entityId);
-        }
-    }
-
-    private static findPlayerSessionByEntityId(entityId: number): Client | null {
-        for (const other of GlobalState.sessionsByToken.values()) {
+    private static findPlayerSessionByEntityId(levelScope: string, entityId: number): Client | null {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (other.clientEntID === entityId && other.character) {
                 return other;
             }
@@ -2184,6 +2790,438 @@ export class CombatHandler {
         return EntityHandler.shouldMirrorClientSpawnEntityToParty(levelName, entity);
     }
 
+    private static canReceivePartySharedHostileHealthSync(anchor: Client, viewer: Client, levelScope: string): boolean {
+        return Boolean(
+            viewer.playerSpawned &&
+            getClientLevelScope(viewer) === levelScope &&
+            (
+                viewer === anchor ||
+                TutorialDungeonMechanics.isTutorialDungeon(levelScope) ||
+                areClientsInSameParty(anchor, viewer)
+            )
+        );
+    }
+
+    private static getPartySharedHostileHpApplyKey(levelScope: string, entityId: number): string {
+        return `${levelScope}:${Math.max(0, Math.round(Number(entityId) || 0))}`;
+    }
+
+    private static rememberPartySharedHostileHpApply(levelScope: string, entityId: number): void {
+        CombatHandler.recentPartySharedHostileHpApplies.set(
+            CombatHandler.getPartySharedHostileHpApplyKey(levelScope, entityId),
+            Date.now()
+        );
+    }
+
+    private static didRecentlyApplyPartySharedHostileHp(levelScope: string, entityId: number): boolean {
+        const key = CombatHandler.getPartySharedHostileHpApplyKey(levelScope, entityId);
+        const lastAt = Math.max(0, Math.round(Number(CombatHandler.recentPartySharedHostileHpApplies.get(key) ?? 0)));
+        const now = Date.now();
+        if (lastAt <= 0) {
+            return false;
+        }
+        if (now - lastAt > CombatHandler.PARTY_SHARED_HOSTILE_HP_DEDUPE_MS) {
+            CombatHandler.recentPartySharedHostileHpApplies.delete(key);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static snapshotPartySharedHostileViewerHealth(
+        anchor: Client,
+        levelScope: string,
+        entity: any
+    ): Map<number, HostileViewerHealthSnapshot> {
+        const snapshots = new Map<number, HostileViewerHealthSnapshot>();
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        if (
+            !levelScope ||
+            canonicalId <= 0 ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return snapshots;
+        }
+
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceivePartySharedHostileHealthSync(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            const localId = CombatHandler.resolvePartySharedHostileLocalIdForViewer(viewer, levelScope, canonicalId, entity);
+            if (localId <= 0) {
+                continue;
+            }
+            const canResolve =
+                viewer.entities.has(localId) ||
+                viewer.knownEntityIds.has(localId);
+            if (!canResolve) {
+                continue;
+            }
+
+            const localEntity = viewer.entities.get(localId) ?? entity;
+            const previousMaxHp = Math.max(0, Math.round(Number(localEntity?.maxHp ?? entity?.maxHp ?? 0)));
+            const rawPreviousHp = Number(localEntity?.hp ?? entity?.hp ?? NaN);
+            const previousHp = Number.isFinite(rawPreviousHp)
+                ? Math.max(0, Math.round(rawPreviousHp))
+                : previousMaxHp;
+            snapshots.set(viewer.token, {
+                localId,
+                previousHp,
+                previousMaxHp
+            });
+        }
+
+        return snapshots;
+    }
+
+    private static resolvePartySharedHostileLocalIdForViewer(
+        viewer: Client,
+        levelScope: string,
+        canonicalId: number,
+        canonicalEntity: any = null
+    ): number {
+        const entityId = Math.max(0, Math.round(Number(canonicalId) || 0));
+        if (!levelScope || entityId <= 0) {
+            return entityId;
+        }
+
+        const sharedEntity = canonicalEntity ?? CombatHandler.resolveLevelEntity(levelScope, entityId);
+        if (
+            !sharedEntity ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), sharedEntity)
+        ) {
+            const existingLocalId = EntityHandler.resolveEntityLocalId(viewer, entityId);
+            return existingLocalId > 0 ? existingLocalId : entityId;
+        }
+
+        const registeredLocalId = EntityHandler.getRegisteredHostileLocalIdForViewer(viewer, sharedEntity);
+        if (registeredLocalId > 0) {
+            return registeredLocalId;
+        }
+
+        const strictResolution = EntityHandler.resolveHostileLocalIdForViewer(
+            viewer,
+            levelScope,
+            entityId,
+            'death-relay'
+        );
+        if (strictResolution.ok && strictResolution.entity && strictResolution.localId > 0) {
+            return strictResolution.localId;
+        }
+
+        for (const [candidateIdValue, candidate] of viewer.entities.entries()) {
+            const candidateId = Math.max(0, Math.round(Number(candidateIdValue) || 0));
+            if (
+                candidateId <= 0 ||
+                candidateId === entityId ||
+                !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), candidate) ||
+                !CombatHandler.isEquivalentHostileEntity(levelScope, sharedEntity, candidate)
+            ) {
+                continue;
+            }
+
+            EntityHandler.rememberEntityAlias(viewer, candidateId, entityId);
+            viewer.knownEntityIds?.add(entityId);
+            EntityHandler.registerCanonicalHostileAlias(viewer, levelScope, sharedEntity, candidateId, 'equivalent_local_backfill');
+            return candidateId;
+        }
+
+        return 0;
+    }
+
+    static resolvePartySharedHostileLocalIdForSharedState(
+        viewer: Client,
+        levelScope: string,
+        canonicalId: number,
+        canonicalEntity: any = null
+    ): number {
+        return CombatHandler.resolvePartySharedHostileLocalIdForViewer(viewer, levelScope, canonicalId, canonicalEntity);
+    }
+
+    private static buildRemoveBuffPayloadFromSnapshot(snapshot: ServerAuthorityBuffSnapshot, targetId: number): Buffer {
+        const payload = snapshot.payloadHex ? Buffer.from(snapshot.payloadHex, 'hex') : Buffer.alloc(0);
+        if (payload.length > 0) {
+            return CombatHandler.replaceLeadingMethod9(payload, targetId);
+        }
+
+        const bb = new BitBuffer(false);
+        bb.writeMethod4(targetId);
+        if (snapshot.buffId > 0) {
+            bb.writeMethod4(snapshot.buffId);
+        }
+        return bb.toBuffer();
+    }
+
+    private static broadcastCanonicalBuffRemoval(
+        levelScope: string,
+        entity: any,
+        snapshot: ServerAuthorityBuffSnapshot,
+        reason: string
+    ): void {
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? snapshot.targetId ?? 0)));
+        if (!levelScope || canonicalId <= 0) {
+            return;
+        }
+
+        const canonicalPayload = CombatHandler.buildRemoveBuffPayloadFromSnapshot(snapshot, canonicalId);
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!viewer.playerSpawned || getClientLevelScope(viewer) !== levelScope) {
+                continue;
+            }
+            if (!CombatHandler.canViewerResolveCombatEntity(viewer, levelScope, canonicalId)) {
+                continue;
+            }
+
+            CombatHandler.sendTranslatedPacket(viewer, 0x0C, canonicalPayload);
+        }
+    }
+
+    private static clearCanonicalHostileBuffs(levelScope: string, entity: any, reason: string): void {
+        if (!entity || typeof entity !== 'object') {
+            return;
+        }
+
+        const activeBuffs = CombatHandler.getServerAuthorityActiveBuffs(entity);
+        const snapshots = Object.values(activeBuffs);
+        if (snapshots.length === 0) {
+            entity.activeBuffs = {};
+            return;
+        }
+
+        for (const snapshot of snapshots) {
+            CombatHandler.broadcastCanonicalBuffRemoval(levelScope, entity, snapshot, reason);
+            delete activeBuffs[snapshot.key];
+        }
+        entity.activeBuffs = {};
+        entity.buffStateVersion = Math.max(0, Math.round(Number(entity.buffStateVersion ?? 0))) + 1;
+        entity.lastBuffStateAt = Date.now();
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (getClientLevelScope(viewer) === levelScope) {
+                CombatHandler.mirrorServerAuthorityBuffStateToViewerCache(viewer, canonicalId, entity);
+            }
+        }
+    }
+
+    private static finalizeHostileDeath(
+        anchor: Client,
+        levelScope: string,
+        entityId: number,
+        entity: any,
+        options: { includeAnchor?: boolean; sendHpCorrection?: boolean; destroyLocal?: boolean; reason?: string } = {}
+    ): void {
+        if (!levelScope || entityId <= 0 || !entity || entity.isPlayer || Number(entity.team ?? 0) !== EntityTeam.ENEMY) {
+            return;
+        }
+
+        const maxHp = Math.max(1, Math.round(Number(entity.maxHp ?? 0)) || CombatHandler.estimateHostileMaxHp(entity, levelScope) || 1);
+        const hpBefore = Math.max(0, Math.round(Number(entity.hp ?? 0)));
+        const alreadyDestroyed = Boolean(entity.destroyed) || Math.max(0, Math.round(Number(entity.deathFinalizedAt ?? 0))) > 0;
+        const finalizedAt = Date.now();
+        if (!alreadyDestroyed) {
+            entity.deathVersion = Math.max(0, Math.round(Number(entity.deathVersion ?? 0))) + 1;
+        } else {
+            entity.deathVersion = Math.max(1, Math.round(Number(entity.deathVersion ?? 1)));
+        }
+        if (hpBefore > 0 || !Boolean(entity.dead) || !Boolean(entity.destroyed)) {
+            CombatHandler.incrementHostileHpVersion(entity);
+        }
+        entity.maxHp = maxHp;
+        entity.hp = 0;
+        entity.healthDelta = -maxHp;
+        entity.health_delta = -maxHp;
+        entity.dead = true;
+        entity.destroyed = true;
+        if (TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)) {
+            entity.bossDeathCommitted = true;
+            entity.bossRespawnBlocked = true;
+        }
+        entity.entState = EntityState.DEAD;
+        entity.deathFinalizedAt = Math.max(0, Math.round(Number(entity.deathFinalizedAt ?? 0))) || finalizedAt;
+        entity.finalDeathReason = options.reason ?? 'hostile_death';
+        entity.aggroTargetEntityId = 0;
+        entity.aggroTargetToken = 0;
+        entity.targetEntityId = 0;
+        entity.targetToken = 0;
+        entity.nextAttack = 0;
+        CombatHandler.clearCanonicalHostileBuffs(levelScope, entity, options.reason ?? 'hostile_death');
+
+        const levelEntity = GlobalState.levelEntities.get(levelScope)?.get(entityId);
+        if (levelEntity && levelEntity !== entity) {
+            levelEntity.maxHp = maxHp;
+            levelEntity.hp = 0;
+            levelEntity.healthDelta = -maxHp;
+            levelEntity.health_delta = -maxHp;
+            levelEntity.dead = true;
+            levelEntity.destroyed = true;
+            if (TutorialDungeonMechanics.isCompletionBoss(levelScope, levelEntity)) {
+                levelEntity.bossDeathCommitted = true;
+                levelEntity.bossRespawnBlocked = true;
+            }
+            levelEntity.entState = EntityState.DEAD;
+            levelEntity.deathFinalizedAt = Math.max(0, Math.round(Number(levelEntity.deathFinalizedAt ?? 0))) || entity.deathFinalizedAt;
+            levelEntity.finalDeathReason = options.reason ?? 'hostile_death_level_copy';
+            levelEntity.aggroTargetEntityId = 0;
+            levelEntity.aggroTargetToken = 0;
+            levelEntity.targetEntityId = 0;
+            levelEntity.targetToken = 0;
+            levelEntity.nextAttack = 0;
+            levelEntity.hpVersion = Math.max(
+                Math.max(0, Math.round(Number(levelEntity.hpVersion ?? 0))),
+                Math.max(0, Math.round(Number(entity.hpVersion ?? 0)))
+            );
+            levelEntity.deathVersion = Math.max(
+                Math.max(0, Math.round(Number(levelEntity.deathVersion ?? 0))),
+                Math.max(0, Math.round(Number(entity.deathVersion ?? 0)))
+            );
+            CombatHandler.clearCanonicalHostileBuffs(levelScope, levelEntity, options.reason ?? 'hostile_death_level_copy');
+        }
+
+        if (CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            EntityHandler.noteServerAuthorityHostileDestroyed(levelScope, entityId, entity, anchor.token);
+        }
+        if (TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)) {
+            TutorialDungeonMechanics.noteBossHealth(anchor, entity);
+        }
+
+        let viewers = 0;
+        if (CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            const canonicalEntity = GlobalState.levelEntities.get(levelScope)?.get(entityId) ?? entity;
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+                if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                    continue;
+                }
+
+                const resolved = EntityHandler.resolveHostileLocalIdForViewer(
+                    viewer,
+                    levelScope,
+                    entityId,
+                    'death-correction'
+                );
+                const registeredLocalId = EntityHandler.getRegisteredHostileLocalIdForViewer(
+                    viewer,
+                    canonicalEntity
+                );
+                const isTutorialCompletionBoss = TutorialDungeonMechanics.isCompletionBoss(
+                    levelScope,
+                    canonicalEntity
+                );
+                const resolvedLocalId = resolved.ok && resolved.localId > 0
+                    ? resolved.localId
+                    : isTutorialCompletionBoss && registeredLocalId > 0
+                        ? registeredLocalId
+                        : isTutorialCompletionBoss
+                            ? EntityHandler.resolveEntityLocalId(viewer, entityId)
+                            : 0;
+                if (resolvedLocalId <= 0) {
+                    continue;
+                }
+                if (CombatHandler.sendHostileDeathCorrectionToViewer(
+                    viewer,
+                    levelScope,
+                    canonicalEntity,
+                    resolvedLocalId,
+                    options.reason ?? 'hostile_death'
+                )) {
+                    viewers++;
+                }
+            }
+
+            CombatHandler.handleCanonicalVisibleServerAuthorityDefeatSideEffects(anchor, levelScope, entity);
+            CombatHandler.grantTutorialCompletionBossReward(
+                anchor,
+                levelScope,
+                canonicalEntity,
+                options.reason ?? 'server_authority_hostile_death'
+            );
+        }
+    }
+
+    private static convergePartySharedHostileHealthToParty(
+        anchor: Client,
+        levelScope: string,
+        entity: any,
+        snapshots: Map<number, HostileViewerHealthSnapshot>,
+        sourceExpectedLocalDelta: number,
+        viewerExpectedLocalDelta: number
+    ): void {
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        if (
+            !levelScope ||
+            canonicalId <= 0 ||
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return;
+        }
+
+        const canonicalHp = Math.max(0, Math.round(Number(entity?.hp ?? 0)));
+        const maxHp = Math.max(1, Math.round(Number(entity?.maxHp ?? 0)) || CombatHandler.estimateHostileMaxHp(entity, levelScope) || 1);
+        const canonicalDead = Boolean(entity?.dead) ||
+            Number(entity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
+            canonicalHp <= 0;
+
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            const snapshot = snapshots.get(viewer.token);
+            if (!snapshot || !CombatHandler.canReceivePartySharedHostileHealthSync(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            const localId = snapshot.localId > 0 ? snapshot.localId : EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+            if (localId <= 0) {
+                continue;
+            }
+
+            const existing = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId) ?? {};
+            viewer.entities.set(localId, {
+                ...existing,
+                ...entity,
+                id: localId,
+                clientSpawned: true,
+                canonicalEntityId: localId === canonicalId ? undefined : canonicalId,
+                sharedCanonicalId: localId === canonicalId ? undefined : canonicalId
+            });
+            viewer.knownEntityIds.add(canonicalId);
+
+            const previousHp = Number.isFinite(snapshot.previousHp)
+                ? Math.max(0, Math.round(snapshot.previousHp))
+                : Math.max(0, Math.round(snapshot.previousMaxHp || maxHp));
+            const expectedLocalDelta = viewer === anchor
+                ? Math.round(Number(sourceExpectedLocalDelta) || 0)
+                : Math.round(Number(viewerExpectedLocalDelta) || 0);
+            const expectedPostPacketHp = Math.max(0, Math.min(maxHp, previousHp + expectedLocalDelta));
+            const correctionDelta = canonicalHp - expectedPostPacketHp;
+            if (correctionDelta !== 0) {
+                viewer.send(
+                    CombatHandler.CLIENT_HEAL_PACKET_ID,
+                    CombatHandler.buildHpDeltaPayload(localId, correctionDelta)
+                );
+            }
+
+            if (canonicalDead) {
+                const localEntity = viewer.entities.get(localId);
+                if (localEntity && typeof localEntity === 'object') {
+                    localEntity.hp = 0;
+                    localEntity.dead = true;
+                    localEntity.entState = EntityState.DEAD;
+                    localEntity.healthDelta = -maxHp;
+                    localEntity.health_delta = -maxHp;
+                }
+                const expectsPendingClientHitToKill = expectedLocalDelta < 0 &&
+                    expectedPostPacketHp <= 0 &&
+                    correctionDelta === 0;
+                if (localEntity && !expectsPendingClientHitToKill) {
+                    viewer.send(0x07, CombatHandler.buildEntityStatePayload(localId, EntityState.DEAD, Boolean(localEntity.facingLeft ?? entity?.facingLeft)));
+                    viewer.send(0x0D, CombatHandler.buildDestroyEntityPayload(localId, true));
+                    viewer.entities.delete(localId);
+                    viewer.entities.delete(canonicalId);
+                    viewer.knownEntityIds.delete(localId);
+                    viewer.knownEntityIds.delete(canonicalId);
+                }
+            }
+        }
+    }
+
     private static getCombatRecipients(anchor: Client, includeAnchor: boolean = false): Client[] {
         const recipients: Client[] = [];
         const levelScope = getClientLevelScope(anchor);
@@ -2191,7 +3229,7 @@ export class CombatHandler {
             return recipients;
         }
 
-        for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!other.playerSpawned || getClientLevelScope(other) !== levelScope) {
                 continue;
             }
@@ -2220,7 +3258,7 @@ export class CombatHandler {
 
         const canonicalEntity = CombatHandler.resolveLevelEntity(levelScope, entityId);
         if (CombatHandler.shouldMirrorClientSpawnEntityToParty(anchor.currentLevel, canonicalEntity)) {
-            return EntityHandler.canClientResolveCanonicalEntity(viewer, entityId);
+            return true;
         }
 
         if (EntityHandler.ensureEntityKnown(viewer, anchor.currentLevel, entityId)) {
@@ -2234,15 +3272,35 @@ export class CombatHandler {
         return false;
     }
 
-    private static relayPartyLocalEntityDefeat(anchor: Client, levelScope: string, entityId: number): void {
+    private static relayPartyLocalEntityDefeat(
+        anchor: Client,
+        levelScope: string,
+        entityId: number,
+        defeatedEntity: any = null,
+        options: { requireKnownOrLocal?: boolean; sendHpCorrection?: boolean; destroyLocal?: boolean; includeAnchor?: boolean } = {}
+    ): void {
         if (!levelScope || entityId <= 0 || !anchor.playerSpawned) {
             return;
         }
 
-        for (const other of GlobalState.sessionsByToken.values()) {
-            const localEntityId = EntityHandler.resolveEntityLocalId(other, entityId);
+        const canonicalEntity = defeatedEntity ?? CombatHandler.resolveLevelEntity(levelScope, entityId);
+        CombatHandler.finalizeHostileDeath(anchor, levelScope, entityId, canonicalEntity, {
+            includeAnchor: options.includeAnchor,
+            sendHpCorrection: options.sendHpCorrection,
+            destroyLocal: options.destroyLocal,
+            reason: 'party_shared_hostile_death'
+        });
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
+            const localEntityId = CombatHandler.resolvePartySharedHostileLocalIdForViewer(other, levelScope, entityId, canonicalEntity);
             let updateEntityId = localEntityId;
-            let localEntity = other.entities.get(localEntityId) ?? other.entities.get(entityId);
+            const clientLocalEntity = other.entities.get(localEntityId) ?? other.entities.get(entityId) ?? null;
+            const canResolveSharedEntity =
+                EntityHandler.canClientResolveCanonicalEntity(other, entityId) ||
+                other.knownEntityIds?.has(entityId) ||
+                other.knownEntityIds?.has(localEntityId) ||
+                other.entities?.has(entityId) ||
+                other.entities?.has(localEntityId);
+            let localEntity = clientLocalEntity ?? (!options.requireKnownOrLocal || canResolveSharedEntity ? canonicalEntity : null);
             if (
                 localEntity &&
                 EntityHandler.isClientOwnPlayerEntity(other, levelScope, localEntityId, localEntity)
@@ -2253,14 +3311,26 @@ export class CombatHandler {
                     : null;
                 updateEntityId = entityId;
             }
-            if (
-                other === anchor ||
-                !other.playerSpawned ||
-                getClientLevelScope(other) !== levelScope ||
-                !areClientsInSameParty(anchor, other) ||
-                !localEntity ||
-                !CombatHandler.shouldMirrorClientSpawnEntityToParty(anchor.currentLevel, localEntity)
-            ) {
+            const skipReason = other === anchor && !options.includeAnchor
+                ? 'source_client_already_destroyed'
+                : !other.playerSpawned
+                    ? 'viewer_not_spawned'
+                    : getClientLevelScope(other) !== levelScope
+                        ? 'scope_mismatch'
+                        : !areClientsInSameParty(anchor, other)
+                            ? 'not_same_party'
+                            : options.requireKnownOrLocal && !canResolveSharedEntity
+                                ? 'viewer_has_not_adopted_shared_entity'
+                                : localEntityId <= 0
+                                    ? 'missing_viewer_local_id'
+                                : !localEntity
+                                    ? 'missing_entity'
+                                    : !CombatHandler.shouldMirrorClientSpawnEntityToParty(anchor.currentLevel, localEntity)
+                                        ? 'not_party_mirror_entity'
+                                        : '';
+            if (skipReason) {
+                if (getScopeLevelName(levelScope) === 'JC_Mini1Hard') {
+                }
                 continue;
             }
 
@@ -2274,7 +3344,615 @@ export class CombatHandler {
             }
             other.entities.set(updateEntityId, localEntity);
             other.knownEntityIds.delete(entityId);
+            other.knownEntityIds.delete(updateEntityId);
+            if (options.sendHpCorrection ?? true) {
+                const correctionHp = maxHp || Math.max(0, Math.round(Number(canonicalEntity?.maxHp ?? canonicalEntity?.hp ?? 0)) || 0);
+                if (correctionHp > 0) {
+                    other.send(0x78, CombatHandler.buildHpDeltaPayload(updateEntityId, -correctionHp));
+                }
+            }
             other.send(0x07, CombatHandler.buildEntityStatePayload(updateEntityId, EntityState.DEAD, Boolean(localEntity.facingLeft)));
+            if (options.destroyLocal ?? true) {
+                other.send(0x0D, CombatHandler.buildDestroyEntityPayload(updateEntityId, true));
+                other.entities.delete(updateEntityId);
+            }
+            if (getScopeLevelName(levelScope) === 'JC_Mini1Hard') {
+            }
+        }
+    }
+
+    private static isServerAuthoritySyncNpc(levelScope: string, entity: any): boolean {
+        return CombatHandler.SERVER_AUTHORITY_SYNC_LEVELS.has(getScopeLevelName(levelScope)) &&
+            EntityHandler.isServerAuthorityHostileEntity(levelScope, entity);
+    }
+
+    private static canReceiveServerAuthorityNpcRelay(anchor: Client, viewer: Client, levelScope: string): boolean {
+        if (
+            viewer.playerSpawned &&
+            viewer !== anchor &&
+            areClientsInSameParty(anchor, viewer) &&
+            CombatHandler.SERVER_AUTHORITY_SYNC_LEVELS.has(getScopeLevelName(levelScope)) &&
+            LevelConfig.normalizeLevelName(viewer.currentLevel) === getScopeLevelName(levelScope) &&
+            getClientLevelScope(viewer) !== levelScope
+        ) {
+            const beforeScope = getClientLevelScope(viewer);
+            EntityHandler.ensureJcMini1PartySharedScope(viewer, getScopeLevelName(levelScope), 'combat_relay_scope_guard');
+        }
+
+        const sameScope = viewer.playerSpawned && getClientLevelScope(viewer) === levelScope;
+        if (TutorialDungeonMechanics.isTutorialDungeon(getScopeLevelName(levelScope))) {
+            return Boolean(sameScope);
+        }
+
+        return Boolean(sameScope && (viewer === anchor || areClientsInSameParty(anchor, viewer)));
+    }
+
+    private static refreshServerAuthorityProgressWithRetries(levelScope: string, reason: string): void {
+        if (!EntityHandler.usesServerAuthorityHostiles(getScopeLevelName(levelScope))) {
+            return;
+        }
+        LevelHandler.scheduleSharedDungeonQuestProgressRefresh(levelScope, { reason });
+    }
+
+    private static getServerAuthorityProxyHpApplyKey(levelScope: string, entityId: number): string {
+        return `${levelScope}:${Math.max(0, Math.round(Number(entityId) || 0))}`;
+    }
+
+    private static rememberServerAuthorityProxyHpApply(levelScope: string, entityId: number): void {
+        const key = CombatHandler.getServerAuthorityProxyHpApplyKey(levelScope, entityId);
+        CombatHandler.recentServerAuthorityProxyHpApplies.set(key, Date.now());
+    }
+
+    private static didRecentlyApplyServerAuthorityProxyHp(levelScope: string, entityId: number): boolean {
+        const key = CombatHandler.getServerAuthorityProxyHpApplyKey(levelScope, entityId);
+        const lastAt = Math.max(0, Math.round(Number(CombatHandler.recentServerAuthorityProxyHpApplies.get(key) ?? 0)));
+        const now = Date.now();
+        if (lastAt <= 0) {
+            return false;
+        }
+        if (now - lastAt > CombatHandler.SERVER_AUTHORITY_PROXY_HP_DEDUPE_MS) {
+            CombatHandler.recentServerAuthorityProxyHpApplies.delete(key);
+            return false;
+        }
+
+        return true;
+    }
+
+    private static getServerAuthorityViewerEntityState(viewer: Client, canonicalId: number): {
+        localId: number;
+        hp: number;
+        maxHp: number;
+        dead: boolean;
+        entState: number;
+        knownCanonical: boolean;
+        knownLocal: boolean;
+        hasCanonicalEntity: boolean;
+        hasLocalEntity: boolean;
+    } {
+        const localId = EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+        const localEntity = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
+        return {
+            localId,
+            hp: Math.round(Number(localEntity?.hp ?? NaN)),
+            maxHp: Math.round(Number(localEntity?.maxHp ?? 0)),
+            dead: Boolean(localEntity?.dead) || Number(localEntity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD,
+            entState: Math.round(Number(localEntity?.entState ?? EntityState.ACTIVE)),
+            knownCanonical: viewer.knownEntityIds.has(canonicalId),
+            knownLocal: viewer.knownEntityIds.has(localId),
+            hasCanonicalEntity: viewer.entities.has(canonicalId),
+            hasLocalEntity: viewer.entities.has(localId)
+        };
+    }
+
+    private static ensureServerAuthorityNpcKnown(
+        viewer: Client,
+        levelScope: string,
+        entity: any,
+        reason: string
+    ): boolean {
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        if (canonicalId <= 0) {
+            return false;
+        }
+
+        const before = CombatHandler.getServerAuthorityViewerEntityState(viewer, canonicalId);
+        if (CombatHandler.canViewerResolveCombatEntity(viewer, levelScope, canonicalId)) {
+            if (!before.knownCanonical && !before.hasCanonicalEntity) {
+            }
+            return true;
+        }
+
+        if (EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelScope)) {
+            return false;
+        }
+
+        EntityHandler.sendEntity(viewer, entity);
+        const after = CombatHandler.getServerAuthorityViewerEntityState(viewer, canonicalId);
+        const resolved = after.knownCanonical || after.hasCanonicalEntity || after.knownLocal || after.hasLocalEntity;
+        return resolved;
+    }
+
+    private static syncServerAuthorityNpcViewerCache(viewer: Client, entity: any): {
+        localId: number;
+        previousHp: number;
+        previousDead: boolean;
+        previousEntState: number;
+    } {
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const canonicalVisible = EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(getClientLevelScope(viewer));
+        const localId = EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+        const targetId = localId > 0 ? localId : canonicalId;
+        const existing = viewer.entities.get(targetId) ?? viewer.entities.get(canonicalId) ?? {};
+        const previousHp = Math.round(Number(existing?.hp ?? NaN));
+        const previousEntState = Math.round(Number(existing?.entState ?? EntityState.ACTIVE));
+        const previousDead = Boolean(existing?.dead) || previousEntState === EntityState.DEAD;
+        const keepClientProxy = canonicalVisible && Boolean(existing?.clientSpawned);
+        viewer.entities.set(targetId, {
+            ...existing,
+            ...entity,
+            id: targetId,
+            clientSpawned: keepClientProxy || targetId !== canonicalId ? true : Boolean(entity.clientSpawned),
+            sharedCanonicalId: targetId !== canonicalId ? canonicalId : existing?.sharedCanonicalId,
+            canonicalEntityId: targetId !== canonicalId ? canonicalId : existing?.canonicalEntityId
+        });
+        viewer.knownEntityIds.add(canonicalId);
+        return {
+            localId: targetId,
+            previousHp,
+            previousDead,
+            previousEntState
+        };
+    }
+
+    private static sendServerAuthorityHpCorrection(
+        viewer: Client,
+        levelScope: string,
+        entity: any,
+        localEntityId: number,
+        previousHp: number,
+        expectedDamage: number,
+        reason: string
+    ): void {
+        const canonicalHp = Math.max(0, Math.round(Number(entity?.hp ?? 0)));
+        const maxHp = Math.max(0, Math.round(Number(entity?.maxHp ?? 0)));
+        const previous = Number.isFinite(previousHp) ? Math.max(0, Math.round(previousHp)) : maxHp;
+        const expectedPostPacketHp = TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)
+            ? previous
+            : Math.max(0, previous - Math.max(0, Math.round(expectedDamage)));
+        const delta = canonicalHp - expectedPostPacketHp;
+        if (delta === 0) {
+            return;
+        }
+        viewer.send(
+            CombatHandler.CLIENT_HEAL_PACKET_ID,
+            CombatHandler.buildHpDeltaPayload(localEntityId, delta)
+        );
+    }
+
+    private static sendAuthoritativeServerAuthorityHpToViewer(
+        viewer: Client,
+        levelScope: string,
+        entity: any,
+        localEntityId: number,
+        reason: string,
+        hpVersion: number
+    ): boolean {
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const localId = Math.max(0, Math.round(Number(localEntityId) || 0));
+        if (canonicalId <= 0 || localId <= 0) {
+            return false;
+        }
+
+        const canonicalHp = Math.max(0, Math.round(Number(entity?.hp ?? 0)));
+        const maxHp = Math.max(1, Math.round(Number(entity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(entity) || 1);
+        const existing = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
+        const previousHpRaw = Number(existing?.hp ?? NaN);
+        const previousHp = Number.isFinite(previousHpRaw)
+            ? Math.max(0, Math.round(previousHpRaw))
+            : maxHp;
+        const hasVisibleLocalEntity = Boolean(
+            existing &&
+            typeof existing === 'object' &&
+            (viewer.entities.has(localId) || viewer.entities.has(canonicalId))
+        );
+        if (TutorialDungeonMechanics.isCompletionBoss(levelScope, entity) && !hasVisibleLocalEntity) {
+            viewer.send(0x78, CombatHandler.buildHpDeltaPayload(localId, maxHp));
+            const damageTaken = Math.max(0, maxHp - canonicalHp);
+            if (damageTaken > 0) {
+                viewer.send(0x78, CombatHandler.buildHpDeltaPayload(localId, -damageTaken));
+            }
+        } else {
+            const delta = canonicalHp - previousHp;
+            viewer.send(0x78, CombatHandler.buildHpDeltaPayload(localId, delta));
+        }
+        viewer.entities.set(localId, {
+            ...(existing ?? {}),
+            ...entity,
+            id: localId,
+            hp: canonicalHp,
+            maxHp,
+            healthDelta: canonicalHp - maxHp,
+            health_delta: canonicalHp - maxHp,
+            canonicalEntityId: localId === canonicalId ? undefined : canonicalId,
+            sharedCanonicalId: localId === canonicalId ? undefined : canonicalId
+        });
+        viewer.knownEntityIds.add(localId);
+        viewer.knownEntityIds.add(canonicalId);
+        return true;
+    }
+
+    private static broadcastAuthoritativeServerAuthorityHp(
+        anchor: Client,
+        levelScope: string,
+        entity: any,
+        reason: string
+    ): number {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return 0;
+        }
+
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const hpVersion = Math.max(0, Math.round(Number(entity?.hpVersion ?? 0)));
+        let count = 0;
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            const resolved = EntityHandler.resolveHostileLocalIdForViewer(viewer, levelScope, canonicalId, 'hp-broadcast-all');
+            const localId = resolved.ok && resolved.localId > 0
+                ? resolved.localId
+                : TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)
+                    ? EntityHandler.getRegisteredHostileLocalIdForViewer(viewer, entity) ||
+                        EntityHandler.resolveEntityLocalId(viewer, canonicalId)
+                    : 0;
+            if (localId <= 0) {
+                continue;
+            }
+
+            if (CombatHandler.sendAuthoritativeServerAuthorityHpToViewer(viewer, levelScope, entity, localId, reason, hpVersion)) {
+                count++;
+            }
+        }
+
+        if (TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)) {
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+                if (getClientLevelScope(viewer) === levelScope) {
+                    EntityHandler.sendTutorialDungeonWorldSnapshot(viewer, reason);
+                }
+            }
+        }
+
+        return count;
+    }
+
+    private static sendHostileDeathCorrectionToViewer(
+        viewer: Client,
+        levelScope: string,
+        canonicalEntity: any,
+        localEntityId: number,
+        reason: string
+    ): boolean {
+        const canonicalId = Math.max(0, Math.round(Number(canonicalEntity?.id ?? 0)));
+        const localId = Math.max(0, Math.round(Number(localEntityId) || 0));
+        if (canonicalId <= 0 || localId <= 0) {
+            return false;
+        }
+
+        const maxHp = Math.max(1, Math.round(Number(canonicalEntity?.maxHp ?? 0)) || EntityHandler.estimateServerAuthorityHostileMaxHp(canonicalEntity) || 1);
+        const existing = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
+        const previousHpRaw = Number(existing?.hp ?? NaN);
+        const previousHp = Number.isFinite(previousHpRaw)
+            ? Math.max(0, Math.round(previousHpRaw))
+            : maxHp;
+        viewer.send(0x78, CombatHandler.buildHpDeltaPayload(localId, -previousHp));
+        viewer.send(0x07, CombatHandler.buildEntityStatePayload(localId, EntityState.DEAD, Boolean(canonicalEntity?.facingLeft)));
+        viewer.send(0x0D, CombatHandler.buildDestroyEntityPayload(localId, true));
+        viewer.entities.delete(localId);
+        viewer.entities.delete(canonicalId);
+        viewer.knownEntityIds.delete(localId);
+        viewer.knownEntityIds.delete(canonicalId);
+        return true;
+    }
+
+    private static convergeServerAuthorityNpcHealthToParty(
+        anchor: Client,
+        levelScope: string,
+        entity: any,
+        reason: string,
+        rawEntityId: number = 0
+    ): void {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return;
+        }
+
+        EntityHandler.normalizeServerAuthorityHostileState(levelScope, entity);
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        if (CombatHandler.isCanonicalHostileTerminal(levelScope, entity)) {
+            CombatHandler.relayServerAuthorityNpcDeath(anchor, levelScope, entity);
+            return;
+        }
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+            if (!CombatHandler.ensureServerAuthorityNpcKnown(viewer, levelScope, entity, reason)) {
+                continue;
+            }
+
+            const cacheState = CombatHandler.syncServerAuthorityNpcViewerCache(viewer, entity);
+            CombatHandler.sendServerAuthorityHpCorrection(
+                viewer,
+                levelScope,
+                entity,
+                cacheState.localId,
+                cacheState.previousHp,
+                0,
+                reason
+            );
+            if (
+                Boolean(entity.dead) ||
+                Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
+                Math.round(Number(entity.hp ?? 0)) <= 0
+            ) {
+                const deathPayload = CombatHandler.buildEntityStatePayload(cacheState.localId, EntityState.DEAD, Boolean(entity.facingLeft));
+                viewer.send(0x07, deathPayload);
+            }
+        }
+    }
+
+    private static sendServerAuthorityAliveCorrection(
+        viewer: Client,
+        levelScope: string,
+        entity: any,
+        reason: string,
+        rawEntityId: number = 0
+    ): void {
+        EntityHandler.normalizeServerAuthorityHostileState(levelScope, entity);
+        if (CombatHandler.isCanonicalHostileTerminal(levelScope, entity)) {
+            const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+            const localId = rawEntityId > 0
+                ? rawEntityId
+                : EntityHandler.resolveHostileLocalIdForViewer(viewer, levelScope, canonicalId, 'alive-correction-converted-to-death').localId;
+            CombatHandler.sendHostileDeathCorrectionToViewer(viewer, levelScope, entity, localId, reason);
+            return;
+        }
+        if (!CombatHandler.ensureServerAuthorityNpcKnown(viewer, levelScope, entity, reason)) {
+            return;
+        }
+
+        const cacheState = CombatHandler.syncServerAuthorityNpcViewerCache(viewer, entity);
+        if (!Boolean(entity.dead) && Number(entity.entState ?? EntityState.ACTIVE) !== EntityState.DEAD) {
+            const activePayload = CombatHandler.buildEntityStatePayload(
+                cacheState.localId,
+                Number(entity.entState ?? EntityState.ACTIVE),
+                Boolean(entity.facingLeft)
+            );
+            viewer.send(0x07, activePayload);
+        }
+        CombatHandler.sendServerAuthorityHpCorrection(viewer, levelScope, entity, cacheState.localId, cacheState.previousHp, 0, reason);
+    }
+
+    static correctServerAuthorityHostileProxy(
+        viewer: Client,
+        levelScope: string,
+        entity: any,
+        reason: string,
+        rawEntityId: number = 0
+    ): void {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return;
+        }
+
+        if (CombatHandler.isCanonicalHostileTerminal(levelScope, entity)) {
+            CombatHandler.relayServerAuthorityNpcDeath(viewer, levelScope, entity);
+            return;
+        }
+
+        CombatHandler.sendServerAuthorityAliveCorrection(viewer, levelScope, entity, reason, rawEntityId);
+    }
+
+    private static snapshotServerAuthorityNpcViewerHealth(
+        anchor: Client,
+        levelScope: string,
+        entity: any
+    ): Map<number, HostileViewerHealthSnapshot> {
+        const snapshots = new Map<number, HostileViewerHealthSnapshot>();
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return snapshots;
+        }
+
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        if (canonicalId <= 0) {
+            return snapshots;
+        }
+
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            const canonicalVisible = EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelScope);
+            const resolvedLocalId = EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+            const localId = canonicalVisible ? canonicalId : (resolvedLocalId > 0 ? resolvedLocalId : canonicalId);
+            const existing =
+                viewer.entities.get(localId) ??
+                viewer.entities.get(canonicalId) ??
+                entity;
+            snapshots.set(viewer.token, {
+                localId,
+                previousHp: Math.round(Number(existing?.hp ?? entity?.hp ?? NaN)),
+                previousMaxHp: Math.max(0, Math.round(Number(existing?.maxHp ?? entity?.maxHp ?? 0)))
+            });
+        }
+
+        return snapshots;
+    }
+
+    private static relayServerAuthorityNpcHit(
+        anchor: Client,
+        levelScope: string,
+        entity: any,
+        payload: Buffer,
+        referencedEntityIds: number[],
+        appliedDamage: number,
+        sourceId: number,
+        preHitSnapshots: Map<number, HostileViewerHealthSnapshot> = new Map<number, HostileViewerHealthSnapshot>()
+    ): boolean {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return false;
+        }
+
+        EntityHandler.normalizeServerAuthorityHostileState(levelScope, entity);
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const viewers: string[] = [];
+        const hitViewers: string[] = [];
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            let missingTargetRef = false;
+            for (const refId of referencedEntityIds) {
+                const canonicalRefId = Math.max(0, Math.round(Number(refId) || 0));
+                if (canonicalRefId <= 0) {
+                    continue;
+                }
+                const refEntity = CombatHandler.resolveLevelEntity(levelScope, canonicalRefId);
+                const refKnown = refEntity && CombatHandler.isServerAuthoritySyncNpc(levelScope, refEntity)
+                    ? CombatHandler.ensureServerAuthorityNpcKnown(viewer, levelScope, refEntity, 'hit_target_snapshot')
+                    : CombatHandler.canViewerResolveCombatEntity(viewer, levelScope, canonicalRefId);
+                if (!refKnown) {
+                    if (canonicalRefId === canonicalId) {
+                        missingTargetRef = true;
+                    }
+                }
+            }
+            if (missingTargetRef) {
+                continue;
+            }
+
+            const cacheState = CombatHandler.syncServerAuthorityNpcViewerCache(viewer, entity);
+            const preHitSnapshot = preHitSnapshots.get(viewer.token);
+            const previousHpForCorrection = Number.isFinite(preHitSnapshot?.previousHp)
+                ? Math.max(0, Math.round(Number(preHitSnapshot?.previousHp)))
+                : cacheState.previousHp;
+            if (
+                cacheState.previousDead &&
+                !Boolean(entity.dead) &&
+                Number(entity.entState ?? EntityState.ACTIVE) !== EntityState.DEAD
+            ) {
+                viewer.send(
+                    0x07,
+                    CombatHandler.buildEntityStatePayload(cacheState.localId, Number(entity.entState ?? EntityState.ACTIVE), Boolean(entity.facingLeft))
+                );
+            }
+
+            const isSourceViewer = viewer === anchor;
+            if (isSourceViewer) {
+                const expectedDamageForCorrection = TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)
+                    ? 0
+                    : appliedDamage;
+                CombatHandler.sendServerAuthorityHpCorrection(
+                    viewer,
+                    levelScope,
+                    entity,
+                    cacheState.localId,
+                    previousHpForCorrection,
+                    expectedDamageForCorrection,
+                    'post_hit_converge'
+                );
+            } else {
+                const previousHp = Number.isFinite(previousHpForCorrection) ? Math.max(0, Math.round(previousHpForCorrection)) : 0;
+                const canonicalHp = Math.max(0, Math.round(Number(entity.hp ?? 0)));
+                const canonicalDead = Boolean(entity.dead) ||
+                    Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD ||
+                    canonicalHp <= 0;
+                if (previousHp > canonicalHp) {
+                    CombatHandler.sendServerAuthorityHpCorrection(
+                        viewer,
+                        levelScope,
+                        entity,
+                        cacheState.localId,
+                        previousHpForCorrection,
+                        0,
+                        canonicalDead ? 'post_lethal_viewer_converge' : 'post_hit_viewer_converge'
+                    );
+                } else if (previousHp < canonicalHp) {
+                    CombatHandler.sendServerAuthorityHpCorrection(
+                        viewer,
+                        levelScope,
+                        entity,
+                        cacheState.localId,
+                        previousHpForCorrection,
+                        0,
+                        'post_hit_positive_converge'
+                    );
+                }
+            }
+            viewers.push(String(viewer.character?.name ?? viewer.token));
+        }
+        return viewers.length > 0;
+    }
+
+    private static relayServerAuthorityNpcDeath(anchor: Client, levelScope: string, entity: any): void {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, entity)) {
+            return;
+        }
+
+        EntityHandler.normalizeServerAuthorityHostileState(levelScope, entity);
+        const entityId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const maxHp = Math.max(1, Math.round(Number(entity.maxHp ?? EntityHandler.estimateServerAuthorityHostileMaxHp(entity))));
+        CombatHandler.finalizeHostileDeath(anchor, levelScope, entityId, entity, {
+            includeAnchor: true,
+            reason: 'server_authority_hostile_death'
+        });
+        entity.level = EntityHandler.SERVER_AUTHORITY_ENTITY_LEVEL;
+        entity.maxHp = maxHp;
+        entity.hp = 0;
+        entity.dead = true;
+        entity.entState = EntityState.DEAD;
+        entity.healthDelta = -maxHp;
+        entity.health_delta = -maxHp;
+
+        const viewers: string[] = [];
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+            viewers.push(String(viewer.character?.name ?? viewer.token));
+        }
+        CombatHandler.refreshServerAuthorityProgressWithRetries(levelScope, 'authoritative_death_relay');
+    }
+
+    private static broadcastServerAuthorityNpcDestroy(
+        anchor: Client,
+        levelScope: string,
+        entityId: number,
+        destroyedEntity: any,
+        immediate: boolean = true
+    ): void {
+        if (!CombatHandler.isServerAuthoritySyncNpc(levelScope, destroyedEntity)) {
+            return;
+        }
+
+        const viewers: Array<{ name: string; token: number; localEntityId: number }> = [];
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!CombatHandler.canReceiveServerAuthorityNpcRelay(anchor, viewer, levelScope)) {
+                continue;
+            }
+
+            const localEntityId = EntityHandler.resolveEntityLocalId(viewer, entityId);
+            viewer.send(0x0D, CombatHandler.buildDestroyEntityPayload(localEntityId, immediate));
+            viewer.entities.delete(localEntityId);
+            viewer.entities.delete(entityId);
+            viewer.knownEntityIds.delete(localEntityId);
+            viewer.knownEntityIds.delete(entityId);
+            viewers.push({
+                name: String(viewer.character?.name ?? viewer.token),
+                token: viewer.token,
+                localEntityId
+            });
         }
     }
 
@@ -2289,7 +3967,7 @@ export class CombatHandler {
             return;
         }
 
-        for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!other.playerSpawned || getClientLevelScope(other) !== levelScope || other === excludedClient) {
                 continue;
             }
@@ -2305,7 +3983,7 @@ export class CombatHandler {
                 continue;
             }
 
-            other.send(packetId, CombatHandler.translateOutboundPacketForViewer(other, packetId, data));
+            CombatHandler.sendTranslatedPacket(other, packetId, data);
         }
     }
 
@@ -2322,13 +4000,14 @@ export class CombatHandler {
         }
 
         const sourceRoomId = Number.isFinite(Number(sourceEntity?.roomId)) ? Number(sourceEntity.roomId) : -1;
+        const partySharedSource = CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), sourceEntity);
         const dedupedRefs = Array.from(new Set(referencedEntityIds.filter((id) => Number.isFinite(id) && id > 0)));
 
-        for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!other.playerSpawned || getClientLevelScope(other) !== levelScope || other === excludedClient) {
                 continue;
             }
-            if (sourceRoomId >= 0 && !sharesRoomIds(other.currentRoomId, sourceRoomId)) {
+            if (sourceRoomId >= 0 && !partySharedSource && !sharesRoomIds(other.currentRoomId, sourceRoomId)) {
                 continue;
             }
 
@@ -2343,7 +4022,7 @@ export class CombatHandler {
                 continue;
             }
 
-            other.send(packetId, CombatHandler.translateOutboundPacketForViewer(other, packetId, data));
+            CombatHandler.sendTranslatedPacket(other, packetId, data);
         }
     }
 
@@ -2365,7 +4044,7 @@ export class CombatHandler {
                 continue;
             }
 
-            other.send(packetId, CombatHandler.translateOutboundPacketForViewer(other, packetId, data));
+            CombatHandler.sendTranslatedPacket(other, packetId, data);
         }
     }
 
@@ -2392,12 +4071,19 @@ export class CombatHandler {
             return false;
         }
 
+        if (
+            EntityHandler.isServerAuthorityHostileEntity(viewer.currentLevel, entity) &&
+            EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(viewer.currentLevel)
+        ) {
+            return EntityHandler.canClientResolveCanonicalEntity(viewer, entityId);
+        }
+
         if (EntityHandler.shouldTrackKnownEntity(viewer.currentLevel, entity)) {
             return EntityHandler.ensureEntityKnown(viewer, viewer.currentLevel, entityId);
         }
 
         if (CombatHandler.shouldMirrorClientSpawnEntityToParty(viewer.currentLevel, entity)) {
-            return EntityHandler.canClientResolveCanonicalEntity(viewer, entityId);
+            return true;
         }
 
         const isRoomScopedClientNpc = Boolean(
@@ -2408,13 +4094,13 @@ export class CombatHandler {
         return isRoomScopedClientNpc;
     }
 
-    private static broadcastPlayerHpDelta(targetSession: Client, delta: number): void {
-        if (!targetSession.playerSpawned || !targetSession.currentLevel || targetSession.clientEntID <= 0 || delta <= 0) {
+    private static broadcastPlayerHpDelta(targetSession: Client, delta: number, includeTarget: boolean = true): void {
+        if (!targetSession.playerSpawned || !targetSession.currentLevel || targetSession.clientEntID <= 0 || delta === 0) {
             return;
         }
 
         const payload = CombatHandler.buildHpDeltaPayload(targetSession.clientEntID, delta);
-        CombatHandler.broadcastToCombatRoom(targetSession, CombatHandler.CLIENT_HEAL_PACKET_ID, payload, true, [targetSession.clientEntID]);
+        CombatHandler.broadcastToCombatRoom(targetSession, CombatHandler.CLIENT_HEAL_PACKET_ID, payload, includeTarget, [targetSession.clientEntID]);
     }
 
     private static broadcastPlayerState(targetSession: Client, entState: number, roomScoped: boolean = false): void {
@@ -2428,7 +4114,7 @@ export class CombatHandler {
         const payload = CombatHandler.buildEntityStatePayload(targetSession.clientEntID, entState, facingLeft);
         if (roomScoped) {
             const levelScope = getClientLevelScope(targetSession);
-            for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
                 if (
                     other === targetSession ||
                     !other.playerSpawned ||
@@ -2439,7 +4125,7 @@ export class CombatHandler {
                     continue;
                 }
 
-                other.send(0x07, CombatHandler.translateOutboundPacketForViewer(other, 0x07, payload));
+                CombatHandler.sendTranslatedPacket(other, 0x07, payload);
             }
             return;
         }
@@ -2465,6 +4151,16 @@ export class CombatHandler {
     }
 
     private static getPlayerCombatPosition(client: Client, levelScope: string): CombatPoint | null {
+        const entityId = Math.max(0, Math.round(Number(client.clientEntID ?? 0)));
+        const localEntity = entityId > 0 && typeof client.entities?.get === 'function'
+            ? client.entities.get(entityId)
+            : null;
+        const livePosition = CombatHandler.getEntityPosition(localEntity) ??
+            CombatHandler.getEntityPosition(CombatHandler.resolveLevelEntity(levelScope, entityId));
+        if (livePosition) {
+            return livePosition;
+        }
+
         const currentLevel = client.character?.CurrentLevel;
         const currentX = Number(currentLevel?.x ?? NaN);
         const currentY = Number(currentLevel?.y ?? NaN);
@@ -2475,12 +4171,7 @@ export class CombatHandler {
             };
         }
 
-        const entityId = Math.max(0, Math.round(Number(client.clientEntID ?? 0)));
-        const localEntity = entityId > 0 && typeof client.entities?.get === 'function'
-            ? client.entities.get(entityId)
-            : null;
-        return CombatHandler.getEntityPosition(localEntity) ??
-            CombatHandler.getEntityPosition(CombatHandler.resolveLevelEntity(levelScope, entityId));
+        return null;
     }
 
     private static isPlayerInBossAggro(levelScope: string, entity: any, session: Client): boolean {
@@ -2489,7 +4180,7 @@ export class CombatHandler {
             return false;
         }
 
-        const bossRoomId = Number.isFinite(Number(entity?.roomId)) ? Math.round(Number(entity.roomId)) : -1;
+        const bossRoomId = getRoomBossAwareRoomId(entity);
         const playerRoomId = Number.isFinite(Number(session.currentRoomId)) ? Math.round(Number(session.currentRoomId)) : -1;
         if (bossRoomId < 0 || playerRoomId < 0 || bossRoomId !== playerRoomId) {
             return false;
@@ -2505,7 +4196,7 @@ export class CombatHandler {
     }
 
     private static hasLivePlayerInBossAggro(levelScope: string, entity: any): boolean {
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (!session.playerSpawned || getClientLevelScope(session) !== levelScope || !session.character) {
                 continue;
             }
@@ -2734,7 +4425,11 @@ export class CombatHandler {
             const deferDungeonCompletionUntilDestroy = Boolean(
                 MissionHandler.shouldProcessEnemyKillStateDungeonCompletion(client, targetEntity)
             );
+            CombatHandler.assignPartySharedHostileCombatAuthority(levelScope, targetEntity, sourceSession);
             const resolution = CombatHandler.updateNpcTargetAfterHit(levelScope, targetId, damage);
+            if (resolution.entity) {
+                TutorialDungeonMechanics.noteBossHealth(sourceSession, resolution.entity);
+            }
             if (resolution.killed && resolution.entity && !deferDungeonCompletionUntilDestroy) {
                 CombatHandler.handleEnemyDefeatState(sourceSession, levelScope, targetId, resolution.entity);
             }
@@ -2774,7 +4469,12 @@ export class CombatHandler {
             return fallbackClient.entities.get(sourceId) ?? null;
         }
 
-        return CombatHandler.findPlayerSessionByEntityId(sourceId)?.entities.get(sourceId) ?? null;
+        const localEntity = fallbackClient.entities.get(sourceId);
+        if (localEntity) {
+            return localEntity;
+        }
+
+        return CombatHandler.findPlayerSessionByEntityId(levelScope, sourceId)?.entities.get(sourceId) ?? null;
     }
 
     private static findSyntheticPowerCastTargetPos(levelScope: string, sourceEntity: any): CombatPoint | null {
@@ -2966,6 +4666,226 @@ export class CombatHandler {
         }
     }
 
+    /**
+     * Soulthieft: a Soulthief's hits carry a share of whatever the target's health pool is,
+     * so the bigger the enemy, the more each strike takes off it.
+     *
+     * This lives on the server because it cannot live anywhere else. The bonus has to read
+     * the target's max HP at the moment of the hit, and the client's damage formula has no
+     * term for that -- every buff property it understands (BleedMultiplier, BoundMultiplier,
+     * MeleeDamage and the rest) multiplies the attacker's own numbers. The server already
+     * rewrites incoming damage here for AdminRuntimeSettings.scaleDamage, so this rides the
+     * same path.
+     *
+     * The cost of that is cosmetic and worth stating: the floating combat number is computed
+     * by the attacker's client and will show the unboosted hit. The health bar is server
+     * authoritative and will drop by the real amount.
+     *
+     * Capped at the base hit, so it doubles a strike at most. Without a cap this scales with
+     * the target's health pool, which is exactly backwards for the bosses that have the
+     * largest pools -- a 1% bite out of a 500k boss would dwarf everything else a rogue does.
+     */
+    private static readonly SOULTHIEFT_MAX_HP_RATE = 0.01;
+
+    private static getSoulthieftMaxHpBonus(
+        sourceSession: Client | null,
+        targetEntity: any,
+        baseDamage: number,
+        levelScope: string
+    ): number {
+        if (
+            !sourceSession?.character ||
+            Number(sourceSession.character.MasterClass ?? 0) !== MasterClassID.Soulthief
+        ) {
+            return 0;
+        }
+
+        const damage = Math.max(0, Math.round(Number(baseDamage) || 0));
+        if (damage <= 0) {
+            return 0;
+        }
+
+        // Not entity.maxHp. A client-spawned hostile never reports its health pool -- the
+        // patched client sends damage deltas only -- so that field is empty on most of what
+        // a rogue actually swings at, and reading it directly made this passive do nothing
+        // at all outside the handful of server-authority levels. getNpcHealthState is the
+        // server's own resolver: explicit maxHp when it has one, the EntTypes-derived pool
+        // otherwise.
+        const maxHp = Math.max(0, Math.round(Number(
+            CombatHandler.getNpcHealthState(targetEntity, levelScope)?.maxHp ?? 0
+        ) || 0));
+        if (maxHp <= 0) {
+            return 0;
+        }
+
+        return Math.min(damage, Math.round(maxHp * CombatHandler.SOULTHIEFT_MAX_HP_RATE));
+    }
+
+    /**
+     * Sentinel: the discipline's melee swing carries a slice of the wearer's own health pool,
+     * which is the stat a Sentinel actually stacks.
+     *
+     * The powers are the Paladin weapon melee attacks -- GearTypes gives every Paladin sword,
+     * mace and axe one of SwordMelee/MaceMelee/AxeMelee, PunchMelee is the unarmed one, and
+     * SFMelee/SFMeleeCombo are what the swing becomes inside Sentinel Form. Those powers are
+     * shared by the whole class, which is exactly why this is server-side: the server knows
+     * MasterClass, so the bonus really is Sentinel-only where a weapon-data change would have
+     * handed it to every Justicar and Templar as well.
+     *
+     * It used to ride ConcussionBolt, the discipline's *ranged* attack, with no Defense term
+     * at all (issue #670).
+     *
+     * The rates are picked against the client's own stat tables rather than guessed. The
+     * issue first asked for 0.01% of max HP and 0.1% of Defense; shipping those showed how
+     * small they are. A level-50 Paladin runs about 122k max HP and 1,680 Defense (GearType's
+     * per-level rune tables) against a basic swing of 5,264 -- BaseDamageMult 1.0 times
+     * Attack -- so the passive was worth 14 damage, a quarter of one percent. At the rates
+     * below it is 368 + 504, about 17% of a swing, and that share holds within half a point
+     * at every level from 10 to 50 because the gear tables and the HP table climb together.
+     *
+     * Defense is deliberately the larger term despite being much the smaller stat. A Sentinel
+     * who stacks Defense should out-damage one who stacks raw Health -- that is the point of
+     * the discipline -- and the 10:1 rate ratio the issue proposed inverts it, because max HP
+     * is some 65 times Defense in absolute terms.
+     *
+     * The ceiling to measure against is Holy Smash, which draws 3 x Defense from one 20-mana
+     * cast. This is a tenth of that, on an attack that costs nothing and swings every 435ms.
+     *
+     * The Defense half needed the client to start telling the server its Defense, which it
+     * never had: patch-dungeonblitz-combat-stats-armor appends armorClass to packet 0xFC.
+     * That is why the term reads off the session rather than off anything the hit carries,
+     * and why it is written to survive a zero -- a browser can serve a cached SWF older than
+     * the server, and such a client sends the packet without the field. When that happens the
+     * Health half still lands and the Defense half is simply absent, which is the failure
+     * mode worth having.
+     */
+    private static readonly SENTINEL_MAX_HP_RATE = 0.003;
+    private static readonly SENTINEL_ARMOR_RATE = 0.3;
+    private static readonly SENTINEL_MELEE_POWER_NAMES = [
+        'SwordMelee',
+        'MaceMelee',
+        'AxeMelee',
+        'PunchMelee',
+        'SFMelee',
+        'SFMeleeCombo'
+    ];
+    private static sentinelMeleePowerIds: Set<number> | null = null;
+
+    /**
+     * Resolved from the authored power data rather than hardcoded, because the ids are
+     * whatever PlayerPowerTypes says they are and a wrong constant here would silently
+     * attach the passive to some unrelated power.
+     */
+    private static getSentinelMeleePowerIds(): Set<number> {
+        if (CombatHandler.sentinelMeleePowerIds) {
+            return CombatHandler.sentinelMeleePowerIds;
+        }
+
+        const ids = new Set<number>();
+        CombatHandler.sentinelMeleePowerIds = ids;
+
+        const xmlDir = resolveClientXmlDir(['PlayerPowerTypes.xml']);
+        if (!xmlDir) {
+            console.warn('[CombatHandler] PlayerPowerTypes.xml not found; the Sentinel melee passive is inactive.');
+            return ids;
+        }
+
+        try {
+            const xml = fs.readFileSync(path.join(xmlDir, 'PlayerPowerTypes.xml'), 'utf8');
+            for (const block of xml.match(/<Power PowerName="[^"]*">[\s\S]*?<\/Power>/g) ?? []) {
+                const name = block.match(/<Power PowerName="([^"]*)">/)?.[1] ?? '';
+                if (!CombatHandler.SENTINEL_MELEE_POWER_NAMES.some((base) => name === base || new RegExp(`^${base}\\d+$`).test(name))) {
+                    continue;
+                }
+
+                const powerId = Math.round(Number(block.match(/<PowerID>([^<]*)<\/PowerID>/)?.[1] ?? 0));
+                if (Number.isFinite(powerId) && powerId > 0) {
+                    ids.add(powerId);
+                }
+            }
+            console.log(`[CombatHandler] Sentinel passive covers ${ids.size} melee attack rank(s).`);
+        } catch (err) {
+            console.warn('[CombatHandler] Could not read PlayerPowerTypes.xml; the Sentinel melee passive is inactive.', err);
+        }
+
+        return ids;
+    }
+
+    private static getSentinelMaxHpBonus(
+        sourceSession: Client | null,
+        powerId: number,
+        baseDamage: number
+    ): number {
+        if (
+            !sourceSession?.character ||
+            Number(sourceSession.character.MasterClass ?? 0) !== MasterClassID.Sentinel
+        ) {
+            return 0;
+        }
+
+        if (!CombatHandler.getSentinelMeleePowerIds().has(Math.round(Number(powerId) || 0))) {
+            return 0;
+        }
+
+        const damage = Math.max(0, Math.round(Number(baseDamage) || 0));
+        if (damage <= 0) {
+            return 0;
+        }
+
+        const maxHp = Math.max(0, Math.round(Number(sourceSession.authoritativeMaxHp ?? 0) || 0));
+        const armorClass = Math.max(0, Math.round(Number(sourceSession.authoritativeArmorClass ?? 0) || 0));
+        return Math.round(maxHp * CombatHandler.SENTINEL_MAX_HP_RATE)
+            + Math.round(armorClass * CombatHandler.SENTINEL_ARMOR_RATE);
+    }
+
+    /**
+     * Justicar: a tenth of the discipline's Expertise is added to its Attack (issue #670).
+     * The Justicar had no passive at all before this.
+     *
+     * Expressed as a share of the hit rather than as a stat, because a stat is not something
+     * the server owns -- the client computes Attack and Expertise and reports both in 0xFC as
+     * meleeDamage and magicDamage. A hit's damage is the power's BaseDamageMult times Attack,
+     * so scaling it by Expertise/Attack lands the same number that adding 10% of Expertise to
+     * Attack would have, for any power that scales off Attack -- which for a Paladin is all of
+     * them.
+     *
+     * Like Soulthieft, the floating combat number the attacker's own client draws will show
+     * the hit before the bonus; the health bar is server authoritative and drops by the real
+     * amount. Unlike a stat change it also does not show up in the Armory's Attack figure,
+     * which is why the passive is spelled out on AxeFlurry's tooltip instead.
+     */
+    private static readonly JUSTICAR_EXPERTISE_TO_ATTACK_RATE = 0.1;
+
+    private static getJusticarExpertiseBonus(
+        sourceSession: Client | null,
+        sourceEntity: any,
+        baseDamage: number
+    ): number {
+        if (
+            !sourceSession?.character ||
+            Number(sourceSession.character.MasterClass ?? 0) !== MasterClassID.Justicar
+        ) {
+            return 0;
+        }
+
+        const damage = Math.max(0, Math.round(Number(baseDamage) || 0));
+        if (damage <= 0) {
+            return 0;
+        }
+
+        // Either copy of the player's entity will do -- CommandHandler writes the declared
+        // stats to both the session's own map and the level's -- but only one of them is
+        // guaranteed to be in hand at a given hit site.
+        const localSource = sourceSession.clientEntID > 0 ? sourceSession.entities.get(sourceSession.clientEntID) : null;
+        const attack = Math.max(Number(sourceEntity?.meleeDamage ?? 0), Number(localSource?.meleeDamage ?? 0));
+        const expertise = Math.max(Number(sourceEntity?.magicDamage ?? 0), Number(localSource?.magicDamage ?? 0));
+        if (!Number.isFinite(attack) || !Number.isFinite(expertise) || attack <= 0 || expertise <= 0) {
+            return 0;
+        }
+
+        return Math.round(damage * CombatHandler.JUSTICAR_EXPERTISE_TO_ATTACK_RATE * (expertise / attack));
+    }
+
     private static updatePlayerTargetAfterHit(targetSession: Client, damage: number, preventDeath: boolean = false): PlayerHitResolution {
         if (damage <= 0 || !targetSession.character || targetSession.clientEntID <= 0) {
             return {
@@ -2992,7 +4912,9 @@ export class CombatHandler {
             };
         }
 
-        const requestedDamage = Math.max(0, Math.round(damage));
+        const requestedDamage = AdminRuntimeSettings.snapshot.godModeEnabled
+            ? 0
+            : Math.max(0, Math.round(damage));
         const minHpAfterHit = preventDeath ? 1 : 0;
         const appliedDamage = Math.max(0, Math.min(requestedDamage, currentHp - minHpAfterHit));
         const nextHp = Math.max(minHpAfterHit, currentHp - appliedDamage);
@@ -3018,8 +4940,13 @@ export class CombatHandler {
         };
     }
 
-    private static updateNpcTargetAfterHit(levelName: string, targetId: number, damage: number): NpcHitResolution {
-        if (!levelName || targetId <= 0 || damage <= 0) {
+    private static updateNpcTargetAfterHit(
+        levelName: string,
+        targetId: number,
+        damage: number,
+        forceLethal: boolean = false
+    ): NpcHitResolution {
+        if (!levelName || targetId <= 0 || (damage <= 0 && !forceLethal)) {
             return {
                 entity: null,
                 entityId: targetId,
@@ -3038,9 +4965,22 @@ export class CombatHandler {
             };
         }
 
+        if (CombatHandler.isTerminalHostileEntity(entity)) {
+            return {
+                entity,
+                entityId: targetId,
+                appliedDamage: 0,
+                killed: true
+            };
+        }
+
+        if (EntityHandler.isServerAuthorityHostileEntity(levelName, entity)) {
+            EntityHandler.normalizeServerAuthorityHostileState(levelName, entity);
+        }
+
         const healthState = CombatHandler.isDungeonBossEntity(levelName, entity)
             ? CombatHandler.resolveHostileHealthStateAcrossCopies(levelName, entity)
-            : CombatHandler.getNpcHealthState(entity);
+            : CombatHandler.getNpcHealthState(entity, levelName);
         if (!healthState) {
             return {
                 entity,
@@ -3053,27 +4993,35 @@ export class CombatHandler {
         const wasAlive = !Boolean(entity.dead) &&
             Number(entity.entState ?? EntityState.ACTIVE) !== EntityState.DEAD &&
             healthState.currentHp > 0;
+        const isPartySharedHostile =
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelName), entity);
         const authoritativeKill =
-            healthState.authoritativeKill &&
+            (healthState.authoritativeKill || isPartySharedHostile) &&
             !CombatHandler.shouldDeferPowerHitKillToClient(levelName, entity);
-        const requestedDamage = Math.max(0, Math.round(damage));
-        const minHpAfterHit = authoritativeKill ? 0 : 1;
+        const commitsDeath = authoritativeKill || forceLethal;
+        const requestedDamage = forceLethal
+            ? healthState.currentHp
+            : Math.max(0, Math.round(damage));
+        const minHpAfterHit = commitsDeath ? 0 : 1;
         const appliedDamage = Math.max(0, Math.min(requestedDamage, healthState.currentHp - minHpAfterHit));
         const nextHp = Math.max(minHpAfterHit, healthState.currentHp - appliedDamage);
 
-        CombatHandler.applyNpcHealthState(entity, healthState.maxHp, nextHp, authoritativeKill);
+        CombatHandler.applyNpcHealthState(entity, healthState.maxHp, nextHp, commitsDeath);
+        if (appliedDamage > 0) {
+            CombatHandler.incrementHostileHpVersion(entity);
+        }
         CombatHandler.syncHostileHealthCopies(levelName, entity, nextHp, healthState.maxHp);
 
         if (usesSharedDungeonProgress(getScopeLevelName(levelName))) {
             noteSharedDungeonHostileState(levelName, targetId, entity);
-            LevelHandler.refreshSharedDungeonQuestProgress(levelName);
+            LevelHandler.scheduleSharedDungeonQuestProgressRefresh(levelName, { reason: 'hostile_health_state' });
         }
 
         return {
             entity,
             entityId: Math.max(0, Math.round(Number(entity.id ?? targetId))),
             appliedDamage,
-            killed: authoritativeKill &&
+            killed: commitsDeath &&
                 wasAlive &&
                 (Boolean(entity.dead) || Number(entity.entState ?? EntityState.ACTIVE) === EntityState.DEAD)
         };
@@ -3093,7 +5041,7 @@ export class CombatHandler {
             return;
         }
 
-        for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelScope)) {
             if (getClientLevelScope(other) !== levelScope) {
                 continue;
             }
@@ -3111,16 +5059,147 @@ export class CombatHandler {
             });
         };
 
-        const hasLiveSocket = Boolean(
-            (client as Client & { socket?: { write?: unknown } }).socket?.write
-        );
+        executeWork();
+    }
 
-        if (hasLiveSocket) {
-            setImmediate(executeWork);
+    private static observeDungeonCompletion(client: Client, entity: any, label: string): void {
+        // Completion state is part of the ordered death packet transaction. Do
+        // not move it to setImmediate: the per-client packet queue is a Promise
+        // chain, so a movement backlog can otherwise starve this work long
+        // after loot and death packets have already been handled.
+        void MissionHandler.handleForcedDungeonBossCompletion(client, entity).catch((error) => {
+            console.error(`[CombatHandler] Error processing ${label}:`, error);
+        });
+    }
+
+    private static handleCanonicalVisibleServerAuthorityDefeatSideEffects(
+        client: Client,
+        levelScope: string,
+        entity: any
+    ): void {
+        const levelName = getScopeLevelName(levelScope);
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const canonicalEntity = canonicalId > 0
+            ? (GlobalState.levelEntities.get(levelScope)?.get(canonicalId) ?? entity)
+            : entity;
+        if (
+            !levelName ||
+            !EntityHandler.usesCanonicalVisibleServerAuthorityHostiles(levelName) ||
+            !EntityHandler.isServerAuthorityHostileEntity(levelName, canonicalEntity)
+        ) {
             return;
         }
 
-        executeWork();
+        const hp = Math.round(Number(canonicalEntity?.hp ?? 0));
+        const dead = Boolean(canonicalEntity?.dead) || Number(canonicalEntity?.entState ?? EntityState.ACTIVE) === EntityState.DEAD;
+        if (hp <= 0 && dead && !Boolean(canonicalEntity?.destroyed)) {
+            CombatHandler.finalizeHostileDeath(client, levelScope, canonicalId, canonicalEntity, {
+                includeAnchor: true,
+                sendHpCorrection: false,
+                reason: 'canonical_visible_reward_finalization'
+            });
+            return;
+        }
+
+        const finalized = Math.round(Number(canonicalEntity?.hp ?? 0)) <= 0 &&
+            Boolean(canonicalEntity?.dead) &&
+            Boolean(canonicalEntity?.destroyed) &&
+            (
+                Math.max(0, Math.round(Number(canonicalEntity?.deathFinalizedAt ?? 0))) > 0 ||
+                Boolean(canonicalEntity?.finalDeathReason)
+            );
+        if (!finalized) {
+            return;
+        }
+
+        if (Boolean(canonicalEntity?.lootDropped)) {
+        } else {
+            const lifeNonce = Math.max(0, Math.round(Number(
+                canonicalEntity?.lifeNonce ?? CombatHandler.getEntityLifeNonce(levelScope, canonicalId)
+            ) || 0));
+            const lootDropNonce = `${levelScope}:${canonicalId}:${lifeNonce}`;
+            canonicalEntity.lootDropped = true;
+            canonicalEntity.lootDropNonce = lootDropNonce;
+            canonicalEntity.lootGrantedTokens = canonicalEntity.lootGrantedTokens instanceof Set
+                ? canonicalEntity.lootGrantedTokens
+                : new Set<number>(Array.isArray(canonicalEntity.lootGrantedTokens) ? canonicalEntity.lootGrantedTokens.map((token: unknown) => Math.round(Number(token) || 0)) : []);
+            canonicalEntity.lootCollectedTokens = canonicalEntity.lootCollectedTokens instanceof Set
+                ? canonicalEntity.lootCollectedTokens
+                : new Set<string>(Array.isArray(canonicalEntity.lootCollectedTokens) ? canonicalEntity.lootCollectedTokens.map((token: unknown) => String(token)) : []);
+            canonicalEntity.lootDrops = canonicalEntity.lootDrops instanceof Map
+                ? canonicalEntity.lootDrops
+                : new Map<number, unknown>();
+            canonicalEntity.deathRewardGrantedAt = Date.now();
+            RewardHandler.grantServerEnemyRewardToEligibleViewers(client, canonicalEntity, {
+                levelScope,
+                lootDropNonce,
+                sourceEnemyCanonicalId: canonicalId,
+                caller: 'canonical_hostile_death'
+            });
+        }
+
+        if (MissionHandler.isRequiredDungeonCompletionBossForLevel(levelName, canonicalEntity, levelScope)) {
+            const roomId = Math.max(0, Math.round(Number(canonicalEntity?.roomId ?? canonicalEntity?.RoomID ?? canonicalEntity?.room_id ?? 0) || 0));
+            LevelHandler.sendRoomUnlock(client, roomId);
+        }
+    }
+
+    private static grantTutorialCompletionBossReward(
+        client: Client,
+        levelScope: string,
+        entity: any,
+        caller: string
+    ): void {
+        const levelName = getScopeLevelName(levelScope);
+        if (
+            !TutorialDungeonMechanics.isTutorialDungeon(levelName) ||
+            !TutorialDungeonMechanics.isCompletionBoss(levelScope, entity)
+        ) {
+            return;
+        }
+
+        const canonicalId = Math.max(0, Math.round(Number(entity?.id ?? 0)));
+        const canonicalEntity = canonicalId > 0
+            ? (GlobalState.levelEntities.get(levelScope)?.get(canonicalId) ?? entity)
+            : entity;
+        if (
+            canonicalId <= 0 ||
+            !EntityHandler.isServerAuthorityHostileEntity(levelName, canonicalEntity) ||
+            Math.round(Number(canonicalEntity?.hp ?? 0)) > 0 ||
+            !Boolean(canonicalEntity?.dead) ||
+            !Boolean(canonicalEntity?.destroyed) ||
+            Math.max(0, Math.round(Number(canonicalEntity?.deathFinalizedAt ?? 0))) <= 0 ||
+            Boolean(canonicalEntity?.lootDropped)
+        ) {
+            return;
+        }
+
+        const lifeNonce = Math.max(0, Math.round(Number(
+            canonicalEntity?.lifeNonce ?? CombatHandler.getEntityLifeNonce(levelScope, canonicalId)
+        ) || 0));
+        const lootDropNonce = `${levelScope}:${canonicalId}:${lifeNonce}`;
+        canonicalEntity.lootDropped = true;
+        canonicalEntity.lootDropNonce = lootDropNonce;
+        canonicalEntity.lootGrantedTokens = canonicalEntity.lootGrantedTokens instanceof Set
+            ? canonicalEntity.lootGrantedTokens
+            : new Set<number>(Array.isArray(canonicalEntity.lootGrantedTokens)
+                ? canonicalEntity.lootGrantedTokens.map((token: unknown) => Math.round(Number(token) || 0))
+                : []);
+        canonicalEntity.lootCollectedTokens = canonicalEntity.lootCollectedTokens instanceof Set
+            ? canonicalEntity.lootCollectedTokens
+            : new Set<string>(Array.isArray(canonicalEntity.lootCollectedTokens)
+                ? canonicalEntity.lootCollectedTokens.map((token: unknown) => String(token))
+                : []);
+        canonicalEntity.lootDrops = canonicalEntity.lootDrops instanceof Map
+            ? canonicalEntity.lootDrops
+            : new Map<number, unknown>();
+        canonicalEntity.deathRewardGrantedAt = Date.now();
+        RewardHandler.grantServerEnemyRewardToEligibleViewers(client, canonicalEntity, {
+            levelScope,
+            lootDropNonce,
+            sourceEnemyCanonicalId: canonicalId,
+            caller
+        });
     }
 
     private static handleEnemyDefeatState(
@@ -3135,6 +5214,7 @@ export class CombatHandler {
         }
 
         if (
+            !options.fromDestroy &&
             !options.fromKillState &&
             MissionHandler.shouldWaitForEnemyKillStateMissionProgress(client, entity)
         ) {
@@ -3142,29 +5222,20 @@ export class CombatHandler {
         }
 
         if (Boolean(entity.questDefeatProcessed)) {
+            CombatHandler.observeDungeonCompletion(client, entity, 'deduplicated dungeon completion observation');
             return;
         }
 
         CombatHandler.markEnemyDefeatProcessed(levelScope, entityId, entity);
+        TutorialDungeonMechanics.noteEntityDefeated(client, entity);
+        CombatHandler.handleCanonicalVisibleServerAuthorityDefeatSideEffects(client, levelScope, entity);
         CombatHandler.fireAndForgetMissionWork(
             client,
             'enemy defeat mission progress',
-            () => MissionHandler.handleEnemyDefeatMissionProgress(client, entity)
+            () => MissionHandler.handleEnemyDefeatMissionProgressForScope(client, levelScope, entity)
         );
 
-        const destroyedOwnerToken = Math.round(Number((entity as any)?.ownerToken ?? 0));
-        const authorityToken = destroyedOwnerToken > 0
-            ? destroyedOwnerToken
-            : (levelScope ? resolveSharedDungeonProgressAuthorityToken(levelScope) : 0);
-        const authorityClient = authorityToken > 0 ? GlobalState.sessionsByToken.get(authorityToken) : null;
-        const completionClient = authorityClient && areClientsInSameLevelScope(client, authorityClient)
-            ? authorityClient
-            : client;
-        CombatHandler.fireAndForgetMissionWork(
-            client,
-            'forced dungeon boss completion',
-            () => MissionHandler.handleForcedDungeonBossCompletion(completionClient, entity)
-        );
+        CombatHandler.observeDungeonCompletion(client, entity, 'forced dungeon boss completion');
     }
 
     private static parseReferencedEntityIds(packetId: number, data: Buffer): number[] {
@@ -3172,6 +5243,7 @@ export class CombatHandler {
         const br = new BitReader(data);
 
         try {
+            
             switch (packetId) {
                 case 0x09: {
                     refs.push(br.readMethod9());
@@ -3216,9 +5288,9 @@ export class CombatHandler {
 
         const sourceSession =
             (fallbackClient.clientEntID === sourceId ? fallbackClient : null) ??
-            CombatHandler.findPlayerSessionByEntityId(sourceId) ??
+            CombatHandler.findPlayerSessionByEntityId(levelScope, sourceId) ??
             (fallbackClient.clientEntID === summonerId ? fallbackClient : null) ??
-            CombatHandler.findPlayerSessionByEntityId(summonerId) ??
+            CombatHandler.findPlayerSessionByEntityId(levelScope, summonerId) ??
             (ownerToken > 0 ? GlobalState.sessionsByToken.get(ownerToken) ?? null : null);
         if (!sourceSession || !sourceSession.playerSpawned || getClientLevelScope(sourceSession) !== levelScope) {
             return;
@@ -3239,9 +5311,9 @@ export class CombatHandler {
 
         const sourceSession =
             (fallbackClient.clientEntID === sourceId ? fallbackClient : null) ??
-            CombatHandler.findPlayerSessionByEntityId(sourceId) ??
+            CombatHandler.findPlayerSessionByEntityId(levelScope, sourceId) ??
             (fallbackClient.clientEntID === summonerId ? fallbackClient : null) ??
-            CombatHandler.findPlayerSessionByEntityId(summonerId) ??
+            CombatHandler.findPlayerSessionByEntityId(levelScope, summonerId) ??
             (ownerToken > 0 ? GlobalState.sessionsByToken.get(ownerToken) ?? null : null);
         if (!sourceSession || !sourceSession.playerSpawned || getClientLevelScope(sourceSession) !== levelScope) {
             return null;
@@ -3258,6 +5330,60 @@ export class CombatHandler {
         return Boolean(sourceSession && sourceSession !== client && !isHostileNpcSource);
     }
 
+    private static isAuthorizedNetworkCombatSource(
+        client: Client,
+        levelScope: string,
+        sourceId: number,
+        sourceSession: Client | null,
+        sourceEntity: any
+    ): boolean {
+        if (sourceSession) {
+            return sourceSession === client;
+        }
+        if (!sourceEntity || sourceId <= 0) {
+            return false;
+        }
+
+        const ownerTokens = [
+            sourceEntity.ownerToken,
+            sourceEntity.aiOwnerToken,
+            sourceEntity.proxyOwnerToken,
+            sourceEntity.combatAuthorityToken
+        ].map((value) => Math.max(0, Math.round(Number(value ?? 0)))).filter((value) => value > 0);
+        if (ownerTokens.length > 0) {
+            return ownerTokens.includes(client.token);
+        }
+        if (Math.max(0, Math.round(Number(sourceEntity.summonerId ?? 0))) === client.clientEntID) {
+            return true;
+        }
+
+        const hostileSource = !sourceEntity.isPlayer && Number(sourceEntity.team ?? 0) === EntityTeam.ENEMY;
+        if (!hostileSource) {
+            return false;
+        }
+        if (!LevelConfig.isDungeonLevel(getScopeLevelName(levelScope))) {
+            return client.entities.has(sourceId);
+        }
+        return Math.max(0, Math.round(Number(sourceEntity.aggroTargetToken ?? 0))) === client.token ||
+            Math.max(0, Math.round(Number(sourceEntity.aggroTargetEntityId ?? 0))) === client.clientEntID;
+    }
+
+    private static shouldSuppressServerAuthorityPlayerHostileHitEcho(
+        levelName: string,
+        sourceSession: Client | null,
+        targetSession: Client | null,
+        isHostileNpcSource: boolean,
+        targetEntity: any,
+        rawTargetEntity: any
+    ): boolean {
+        if (!EntityHandler.usesServerAuthorityHostiles(levelName) || !sourceSession || targetSession || isHostileNpcSource) {
+            return false;
+        }
+
+        const candidate = targetEntity ?? rawTargetEntity;
+        return Boolean(candidate && !candidate.isPlayer && Number(candidate.team ?? 0) === EntityTeam.ENEMY);
+    }
+
     static async handlePowerCast(client: Client, data: Buffer): Promise<void> {
         if (LevelHandler.isGoblinRiverBossIntroLocked(client)) {
             return;
@@ -3267,20 +5393,35 @@ export class CombatHandler {
             return;
         }
 
+        const levelScope = getClientLevelScope(client);
         const aliasedSourceId = EntityHandler.resolveEntityAlias(client, info.sourceId);
-        if (aliasedSourceId !== info.sourceId) {
-            info.sourceId = aliasedSourceId;
+        const canonicalSourceId = CombatHandler.resolveClientHostileEntityAlias(client, levelScope, aliasedSourceId);
+        if (canonicalSourceId !== info.sourceId) {
+            info.sourceId = canonicalSourceId;
             data = CombatHandler.buildPowerCastPayload(info);
         }
 
-        const levelScope = getClientLevelScope(client);
         if (CombatHandler.shouldSuppressCutsceneHostileCombat(client, levelScope, info.sourceId)) {
             return;
         }
 
         const sourceSession = CombatHandler.resolveCombatSourceSession(levelScope, info.sourceId, client);
+        if (sourceSession && TutorialDungeonMechanics.isTutorialDungeon(levelScope)) {
+            const sequences = ((sourceSession as any).serverAuthorityCastSequences ??= new Map<string, number>()) as Map<string, number>;
+            const castKey = `${levelScope}:${info.sourceId}:${info.powerId}`;
+            sequences.set(castKey, Math.max(0, Math.round(Number(sequences.get(castKey) ?? 0))) + 1);
+        }
         const sourceEntity = CombatHandler.resolvePowerCastSourceEntity(levelScope, info.sourceId, client);
+        if (!CombatHandler.isAuthorizedNetworkCombatSource(client, levelScope, info.sourceId, sourceSession, sourceEntity)) {
+            return;
+        }
         if (CombatHandler.shouldSuppressHostileBossPower(levelScope, sourceEntity)) {
+            return;
+        }
+        if (CombatHandler.shouldSuppressDeadPartySharedHostileAction(client, levelScope, sourceEntity, 'power_cast')) {
+            return;
+        }
+        if (CombatHandler.shouldSuppressNonAuthorityPartySharedHostileAction(client, levelScope, sourceEntity)) {
             return;
         }
         if (sourceSession) {
@@ -3293,6 +5434,19 @@ export class CombatHandler {
                 isPersistent: info.isPersistent,
                 comboData: info.comboData
             });
+        }
+        // Only the player's own casts are metered. A client also relays the hostiles it
+        // owns, and a room full of them is not the player casting fast. Charged before the
+        // mobility grace below, so a refused cast does not buy a blink's worth of movement.
+        if (
+            EntityHandler.isClientOwnPlayerEntity(client, levelScope, info.sourceId, sourceEntity) &&
+            !CastRateAuthority.chargeCast(client, info.powerId)
+        ) {
+            return;
+        }
+
+        if (sourceSession === client) {
+            MovementAuthority.noteMobilityCast(client, info.powerId);
         }
 
         const relayPayload = CombatHandler.normalizePowerCastRelay(client, info, data);
@@ -3308,6 +5462,8 @@ export class CombatHandler {
     }
 
     static async handlePowerHit(client: Client, data: Buffer): Promise<void> {
+        
+
         if (LevelHandler.isGoblinRiverBossIntroLocked(client)) {
             return;
         }
@@ -3317,9 +5473,14 @@ export class CombatHandler {
         }
         const info = CombatHandler.resolveClientEntityAliases(client, parsedInfo);
 
-        const { targetId, sourceId, damage } = info;
+        const { targetId, sourceId, damage: packetDamage } = info;
+        let damage = packetDamage;
         const currentLevel = client.currentLevel;
         const levelScope = getClientLevelScope(client);
+        // The cutscene lock exists to stop mobs beating on a player who is stuck watching boss
+        // dialogue -- it was never meant to disarm the player. Blanket-locking this handler ate
+        // every player hit landed during the speech (Meteor Channel, Firebrand, Plague Battalion),
+        // so only the hostile-source check below applies here.
         if (CombatHandler.shouldSuppressCutsceneHostileCombat(client, levelScope, sourceId)) {
             return;
         }
@@ -3327,18 +5488,68 @@ export class CombatHandler {
         if (CombatHandler.shouldSuppressHostileBossPower(levelScope, powerSourceEntity)) {
             return;
         }
+        const rawTargetEntity = client.entities.get(parsedInfo.targetId) ?? null;
         const targetEntity = CombatHandler.resolveLevelEntity(levelScope, targetId);
-        const sourceEntity = CombatHandler.resolveLevelEntity(levelScope, sourceId);
+        const sourceEntity = CombatHandler.resolvePowerCastSourceEntity(levelScope, sourceId, client);
         const isHostileNpcSource = Boolean(
             sourceEntity &&
             !sourceEntity.isPlayer &&
             Number(sourceEntity.team ?? 0) === EntityTeam.ENEMY
         );
+        if (targetEntity && CombatHandler.isTerminalHostileEntity(targetEntity)) {
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.isTerminalHostileEntity(sourceEntity)) {
+            const sourceCanonicalId = Math.max(0, Math.round(Number(sourceEntity?.id ?? sourceId)));
+            if (
+                sourceCanonicalId > 0 &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), sourceEntity)
+            ) {
+                CombatHandler.relayPartyLocalEntityDefeat(
+                    client,
+                    levelScope,
+                    sourceCanonicalId,
+                    sourceEntity,
+                    { requireKnownOrLocal: false, sendHpCorrection: false, includeAnchor: true }
+                );
+            }
+            CombatHandler.sendPostDeathSourceCorrection(client, levelScope, sourceEntity, parsedInfo.sourceId, 'powerhit-source');
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.shouldSuppressDeadPartySharedHostileAction(client, levelScope, sourceEntity, 'power_hit')) {
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.shouldSuppressNonAuthorityPartySharedHostileAction(client, levelScope, sourceEntity)) {
+            return;
+        }
         if (targetEntity && !targetEntity.isPlayer && Boolean(targetEntity.untargetable)) {
             return;
         }
 
+        // The damage number rides on this packet, so a refused cast has to take its hits
+        // with it or the rate limit costs the cheater nothing.
+        if (
+            EntityHandler.isClientOwnPlayerEntity(client, levelScope, sourceId, sourceEntity) &&
+            CastRateAuthority.isHitBlocked(client, info.powerId)
+        ) {
+            return;
+        }
+
         const sourceSession = CombatHandler.resolveCombatSourceSession(levelScope, sourceId, client);
+        const targetSession = CombatHandler.findPlayerSessionByEntityId(levelScope, targetId);
+        const isPlayerSource = Boolean(sourceSession && !isHostileNpcSource);
+        if (isPlayerSource && targetEntity && !targetEntity.isPlayer) {
+            damage = AdminRuntimeSettings.scaleDamage(damage);
+            damage += CombatHandler.getSoulthieftMaxHpBonus(sourceSession, targetEntity, damage, levelScope);
+            damage += CombatHandler.getSentinelMaxHpBonus(sourceSession, info.powerId, damage);
+            damage += CombatHandler.getJusticarExpertiseBonus(sourceSession, sourceEntity, damage);
+        }
+        if (
+            (!targetEntity && !targetSession) ||
+            !CombatHandler.isAuthorizedNetworkCombatSource(client, levelScope, sourceId, sourceSession, sourceEntity)
+        ) {
+            return;
+        }
         if (CombatHandler.shouldSuppressForeignOwnedHit(client, sourceSession, isHostileNpcSource)) {
             return;
         }
@@ -3350,6 +5561,27 @@ export class CombatHandler {
             CombatHandler.didRecentlyApplyFireBrandPiercingCastDamage(levelScope, sourceId)
         ) {
             return;
+        }
+        if (targetEntity && TutorialDungeonMechanics.isCompletionBoss(levelScope, targetEntity)) {
+            const authorityClient = sourceSession ?? client;
+            const sequences = ((authorityClient as any).serverAuthorityCastSequences ?? new Map<string, number>()) as Map<string, number>;
+            const castSequence = Math.max(0, Math.round(Number(sequences.get(`${levelScope}:${sourceId}:${info.powerId}`) ?? 0)));
+            const eventId = `${sourceId}:${targetId}:${info.powerId}:${castSequence}:${damage}:${info.isCrit ? 1 : 0}`;
+            const processed = (targetEntity.processedDamageEventIds ??= new Set<string>()) as Set<string>;
+            if (castSequence > 0) {
+                if (processed.has(eventId)) {
+                    return;
+                }
+                processed.add(eventId);
+            } else {
+                const fallbackKey = `${levelScope}:${authorityClient.token}:${data.toString('hex')}`;
+                const now = Date.now();
+                const lastAt = Math.max(0, Number(CombatHandler.recentTutorialBossHitPackets.get(fallbackKey) ?? 0));
+                CombatHandler.recentTutorialBossHitPackets.set(fallbackKey, now);
+                if (lastAt > 0 && now - lastAt <= 100) {
+                    return;
+                }
+            }
         }
 
         if (client.currentLevel === 'CraftTownTutorial' && client.keepTutorialState) {
@@ -3377,7 +5609,15 @@ export class CombatHandler {
         }
 
         let relayDamage = damage;
-        const targetSession = CombatHandler.findPlayerSessionByEntityId(targetId);
+        let serverAuthorityNpcResolution: NpcHitResolution | null = null;
+        let partySharedHostileHealthRelay: {
+            entity: any;
+            snapshots: Map<number, HostileViewerHealthSnapshot>;
+            appliedDamage: number;
+        } | null = null;
+        let partySharedHostileDeathRelay: { entityId: number; entity: any; anchor: Client } | null = null;
+        let pendingEnemyDefeat: { client: Client; entityId: number; entity: any } | null = null;
+        let serverAuthorityNpcSnapshots = new Map<number, HostileViewerHealthSnapshot>();
         if (targetSession && areClientsInSameLevelScope(client, targetSession)) {
             const resolution = CombatHandler.updatePlayerTargetAfterHit(targetSession, damage);
             relayDamage = resolution.appliedDamage;
@@ -3398,9 +5638,74 @@ export class CombatHandler {
                 Number(targetEntity.team ?? 0) === EntityTeam.ENEMY &&
                 MissionHandler.shouldProcessEnemyKillStateDungeonCompletion(client, targetEntity)
             );
-            const resolution = CombatHandler.updateNpcTargetAfterHit(levelScope, targetId, damage);
+            const partySharedHostileSnapshots = targetEntity &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(currentLevel, targetEntity)
+                ? CombatHandler.snapshotPartySharedHostileViewerHealth(sourceSession ?? client, levelScope, targetEntity)
+                : new Map<number, HostileViewerHealthSnapshot>();
+            serverAuthorityNpcSnapshots = targetEntity &&
+                CombatHandler.isServerAuthoritySyncNpc(levelScope, targetEntity)
+                ? CombatHandler.snapshotServerAuthorityNpcViewerHealth(sourceSession ?? client, levelScope, targetEntity)
+                : new Map<number, HostileViewerHealthSnapshot>();
+            CombatHandler.assignPartySharedHostileCombatAuthority(levelScope, targetEntity, sourceSession ?? client);
+            const hpBefore = Math.max(0, Math.round(Number(targetEntity?.hp ?? 0)));
+            const resolution = CombatHandler.updateNpcTargetAfterHit(
+                levelScope,
+                targetId,
+                damage,
+                isPlayerSource && AdminRuntimeSettings.snapshot.oneHitEnabled
+            );
+            if (resolution.entity && Math.max(0, Math.round(Number(resolution.appliedDamage ?? 0))) > 0) {
+                TutorialDungeonMechanics.noteBossHealth(sourceSession ?? client, resolution.entity);
+                if (CombatHandler.isServerAuthoritySyncNpc(levelScope, resolution.entity)) {
+                    CombatHandler.broadcastAuthoritativeServerAuthorityHp(
+                        sourceSession ?? client,
+                        levelScope,
+                        resolution.entity,
+                        'powerhit'
+                    );
+                }
+            }
+            if (resolution.entity) {
+                relayDamage = Math.max(0, Math.round(Number(resolution.appliedDamage ?? relayDamage)));
+                if (CombatHandler.shouldMirrorClientSpawnEntityToParty(currentLevel, resolution.entity)) {
+                }
+            }
+            if (resolution.entity && CombatHandler.isServerAuthoritySyncNpc(levelScope, resolution.entity)) {
+                serverAuthorityNpcResolution = resolution;
+                relayDamage = Math.max(0, Math.round(Number(resolution.appliedDamage ?? relayDamage)));
+            }
+            if (
+                resolution.entity &&
+                !serverAuthorityNpcResolution &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(currentLevel, resolution.entity)
+            ) {
+                partySharedHostileHealthRelay = {
+                    entity: resolution.entity,
+                    snapshots: partySharedHostileSnapshots,
+                    appliedDamage: Math.max(0, Math.round(Number(resolution.appliedDamage ?? 0)))
+                };
+                CombatHandler.rememberPartySharedHostileHpApply(
+                    levelScope,
+                    Math.max(0, Math.round(Number(resolution.entityId ?? resolution.entity.id ?? targetId)))
+                );
+            }
             if (resolution.killed && resolution.entity && !deferDungeonCompletionUntilDestroy) {
-                CombatHandler.handleEnemyDefeatState(sourceSession ?? client, levelScope, targetId, resolution.entity);
+                pendingEnemyDefeat = {
+                    client: sourceSession ?? client,
+                    entityId: targetId,
+                    entity: resolution.entity
+                };
+            }
+            if (
+                resolution.killed &&
+                resolution.entity &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(currentLevel, resolution.entity)
+            ) {
+                partySharedHostileDeathRelay = {
+                    entityId: Math.max(0, Math.round(Number(resolution.entityId ?? targetId))),
+                    entity: resolution.entity,
+                    anchor: sourceSession ?? client
+                };
             }
         }
 
@@ -3408,6 +5713,58 @@ export class CombatHandler {
         const relayPayload = displayRelayDamage === damage && info === parsedInfo
             ? data
             : CombatHandler.buildPowerHitPayload(info, displayRelayDamage);
+        if (partySharedHostileHealthRelay?.entity) {
+            CombatHandler.convergePartySharedHostileHealthToParty(
+                sourceSession ?? client,
+                levelScope,
+                partySharedHostileHealthRelay.entity,
+                partySharedHostileHealthRelay.snapshots,
+                -displayRelayDamage,
+                -displayRelayDamage
+            );
+        }
+        if (serverAuthorityNpcResolution?.entity) {
+            CombatHandler.rememberServerAuthorityProxyHpApply(
+                levelScope,
+                Math.max(0, Math.round(Number(serverAuthorityNpcResolution.entity.id ?? targetId)))
+            );
+            const relayed = CombatHandler.relayServerAuthorityNpcHit(
+                client,
+                levelScope,
+                serverAuthorityNpcResolution.entity,
+                relayPayload,
+                [targetId, sourceId],
+                Math.max(0, Math.round(Number(serverAuthorityNpcResolution.appliedDamage ?? displayRelayDamage))),
+                sourceId,
+                serverAuthorityNpcSnapshots
+            );
+            if (serverAuthorityNpcResolution.killed) {
+                CombatHandler.relayServerAuthorityNpcDeath(client, levelScope, serverAuthorityNpcResolution.entity);
+            }
+            if (pendingEnemyDefeat) {
+                CombatHandler.handleEnemyDefeatState(
+                    pendingEnemyDefeat.client,
+                    levelScope,
+                    pendingEnemyDefeat.entityId,
+                    pendingEnemyDefeat.entity
+                );
+            }
+            if (relayed) {
+                return;
+            }
+        }
+        if (
+            CombatHandler.shouldSuppressServerAuthorityPlayerHostileHitEcho(
+                currentLevel,
+                sourceSession,
+                targetSession,
+                isHostileNpcSource,
+                targetEntity,
+                rawTargetEntity
+            )
+        ) {
+            return;
+        }
         if (isHostileNpcSource) {
             const excludeLocalVictim = targetSession === client ? client : null;
             CombatHandler.broadcastEntityViewPacket(levelScope, sourceEntity, 0x0A, relayPayload, [targetId, sourceId], excludeLocalVictim);
@@ -3417,15 +5774,32 @@ export class CombatHandler {
         CombatHandler.broadcastCombatPacket(client, 0x0A, relayPayload, {
             referencedEntityIds: [targetId, sourceId]
         });
+        if (partySharedHostileDeathRelay) {
+            CombatHandler.relayPartyLocalEntityDefeat(
+                partySharedHostileDeathRelay.anchor,
+                levelScope,
+                partySharedHostileDeathRelay.entityId,
+                partySharedHostileDeathRelay.entity,
+                { requireKnownOrLocal: true, sendHpCorrection: false, includeAnchor: true }
+            );
+        }
+        if (pendingEnemyDefeat) {
+            CombatHandler.handleEnemyDefeatState(
+                pendingEnemyDefeat.client,
+                levelScope,
+                pendingEnemyDefeat.entityId,
+                pendingEnemyDefeat.entity
+            );
+        }
     }
 
     static async handleProjectileExplode(client: Client, data: Buffer): Promise<void> {
         if (LevelHandler.isGoblinRiverBossIntroLocked(client)) {
             return;
         }
-        if (LevelHandler.isDungeonCutsceneCombatLocked(client)) {
-            return;
-        }
+        // A projectile only reaches its explode packet if the cast that spawned it was allowed,
+        // and hostile casts are already suppressed during a cutscene. Gating the explode as well
+        // only swallowed the player's own projectiles mid-dialogue.
         CombatHandler.broadcastCombatPacket(client, 0x0E, data, {
             referencedEntityIds: CombatHandler.parseReferencedEntityIds(0x0E, data)
         });
@@ -3434,8 +5808,8 @@ export class CombatHandler {
     static async handleEntityDestroy(client: Client, data: Buffer): Promise<void> {
         const br = new BitReader(data);
         const rawEntityId = br.readMethod9();
-        const entityId = EntityHandler.resolveEntityAlias(client, rawEntityId);
-        const destroyPayload = rawEntityId === entityId
+        let entityId = EntityHandler.resolveEntityAlias(client, rawEntityId);
+        let destroyPayload = rawEntityId === entityId
             ? data
             : (() => {
                 const bb = new BitBuffer(false);
@@ -3445,9 +5819,105 @@ export class CombatHandler {
             })();
         const levelName = client.currentLevel;
         const levelScope = getClientLevelScope(client);
-        const destroyedEntity =
-            client.entities.get(entityId) ??
-            (levelScope ? GlobalState.levelEntities.get(levelScope)?.get(entityId) : null);
+        if (levelScope) {
+            const sharedEntityId = CombatHandler.resolveClientHostileEntityAlias(client, levelScope, entityId);
+            if (sharedEntityId !== entityId) {
+                entityId = sharedEntityId;
+                destroyPayload = CombatHandler.buildDestroyEntityPayload(entityId, true);
+            }
+        }
+        const canonicalDestroyedEntity = levelScope ? GlobalState.levelEntities.get(levelScope)?.get(entityId) : null;
+        const canonicalServerAuthorityEntity = CombatHandler.isServerAuthoritySyncNpc(levelScope, canonicalDestroyedEntity)
+            ? canonicalDestroyedEntity
+            : null;
+        const rawLocalDestroyedEntity = client.entities.get(rawEntityId) ?? null;
+        const destroyedEntity = EntityHandler.usesServerAuthorityHostiles(levelName)
+            ? (canonicalServerAuthorityEntity ?? client.entities.get(entityId) ?? rawLocalDestroyedEntity ?? canonicalDestroyedEntity)
+            : (client.entities.get(entityId) ?? canonicalDestroyedEntity ?? rawLocalDestroyedEntity);
+        // A Legends' Inn stage opens its exit on the body leaving, not on the death,
+        // so this packet - the client telling us the corpse is gone - is the signal.
+        LegendsInn.noteEntityDestroyed(client, destroyedEntity);
+
+        const scriptedAuthority = TutorialDungeonMechanics.isTutorialDungeon(levelName)
+            ? TutorialDungeonMechanics.getAuthorityEntity(rawLocalDestroyedEntity, Number(client.currentRoomId ?? 0))
+            : null;
+        if (scriptedAuthority && scriptedAuthority.role !== 'boss' && scriptedAuthority.role !== 'anna') {
+            const transition = TutorialDungeonMechanics.commitClientObjectDefeat(client, rawLocalDestroyedEntity);
+            if (transition.accepted && transition.authority) {
+                rawLocalDestroyedEntity.dead = true;
+                rawLocalDestroyedEntity.destroyed = true;
+                rawLocalDestroyedEntity.hp = 0;
+                rawLocalDestroyedEntity.entState = EntityState.DEAD;
+                EntityHandler.broadcastTutorialDungeonObjectTransition(client, transition.authority);
+                if (transition.authority.role === 'anna_chain') {
+                    await MissionHandler.handleForcedDungeonObjectiveCompletion(client, rawLocalDestroyedEntity);
+                }
+            } else if (transition.dedupe) {
+                EntityHandler.applyTutorialDungeonWorldSnapshotToLocalObject(client, rawLocalDestroyedEntity, rawEntityId);
+            }
+            return;
+        }
+        if (
+            destroyedEntity &&
+            CombatHandler.isTerminalHostileEntity(destroyedEntity) &&
+            DungeonCompletionConditions.isRequiredBoss(levelName, destroyedEntity, levelScope)
+        ) {
+            destroyedEntity.clientDefeatVerified = true;
+            await MissionHandler.handleForcedDungeonBossCompletion(client, destroyedEntity);
+        }
+        let isSeedOutsideClientSpawnDestroy = false;
+        if (
+            destroyedEntity &&
+            !Boolean(destroyedEntity.isPlayer) &&
+            Number(destroyedEntity.team ?? 0) === EntityTeam.ENEMY &&
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(levelName, destroyedEntity)
+        ) {
+        }
+        if (EntityHandler.usesServerAuthorityHostiles(levelName)) {
+            const isCanonicalServerAuthorityDestroy = Boolean(
+                canonicalServerAuthorityEntity ||
+                CombatHandler.isServerAuthoritySyncNpc(levelScope, destroyedEntity)
+            );
+            isSeedOutsideClientSpawnDestroy = Boolean(
+                !isCanonicalServerAuthorityDestroy &&
+                rawLocalDestroyedEntity &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(levelName, rawLocalDestroyedEntity)
+            );
+            if (isSeedOutsideClientSpawnDestroy) {
+                entityId = rawEntityId;
+                destroyPayload = data;
+            } else
+            if (!destroyedEntity || !CombatHandler.isServerAuthoritySyncNpc(levelScope, destroyedEntity)) {
+                EntityHandler.destroyClientLocalEntity(client, rawEntityId, 'client_destroy_unresolved_server_authority', destroyedEntity);
+                return;
+            }
+
+            if (!isSeedOutsideClientSpawnDestroy) {
+                if (Boolean(destroyedEntity.destroyed)) {
+                    CombatHandler.sendHostileDeathCorrectionToViewer(
+                        client,
+                        levelScope,
+                        destroyedEntity,
+                        rawEntityId,
+                        'client_destroy_post_death'
+                    );
+                    return;
+                }
+                EntityHandler.normalizeServerAuthorityHostileState(levelScope, destroyedEntity);
+            }
+
+            if (
+                !isSeedOutsideClientSpawnDestroy &&
+                Math.round(Number(destroyedEntity.hp ?? 0)) > 0
+            ) {
+                destroyedEntity.dead = false;
+                if (Number(destroyedEntity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                    destroyedEntity.entState = EntityState.ACTIVE;
+                }
+                CombatHandler.sendServerAuthorityAliveCorrection(client, levelScope, destroyedEntity, 'client_destroy_rejected_alive', rawEntityId);
+                return;
+            }
+        }
         if (EntityHandler.isHomeDummyEntity(destroyedEntity)) {
             destroyedEntity.entState = EntityState.ACTIVE;
             destroyedEntity.dead = false;
@@ -3455,7 +5925,7 @@ export class CombatHandler {
             destroyedEntity.health_delta = 0;
             destroyedEntity.hp = Math.max(
                 1,
-                Math.round(Number(destroyedEntity.maxHp ?? 0)) || CombatHandler.estimateHostileMaxHp(destroyedEntity)
+                Math.round(Number(destroyedEntity.maxHp ?? 0)) || CombatHandler.estimateHostileMaxHp(destroyedEntity, levelScope)
             );
             if (levelScope) {
                 const scopedEntity = GlobalState.levelEntities.get(levelScope)?.get(entityId);
@@ -3486,8 +5956,82 @@ export class CombatHandler {
             destroyedEntity &&
             !destroyedEntity.isPlayer &&
             Number(destroyedEntity.team ?? 0) === EntityTeam.ENEMY &&
-            !MissionHandler.shouldIgnoreUnverifiedDungeonBossDefeat(levelName, destroyedEntity)
+            !MissionHandler.shouldIgnoreUnverifiedDungeonBossDefeat(levelName, destroyedEntity, levelScope)
         );
+
+        if (shouldMirrorClientSpawnEntity && destroyedEntity && !isSeedOutsideClientSpawnDestroy) {
+            const healthState = CombatHandler.resolveHostileHealthStateAcrossCopies(levelScope, destroyedEntity) ??
+                CombatHandler.getNpcHealthState(destroyedEntity, levelScope);
+            const canonicalHp = Math.max(0, Math.round(Number(destroyedEntity.hp ?? healthState?.currentHp ?? 0)));
+            const verifiedRequiredBossDestroy = Boolean(
+                contributionSnapshot?.contributors?.length &&
+                MissionHandler.shouldCompleteDungeonFromBossHpReport(client, destroyedEntity)
+            );
+            if (Boolean(destroyedEntity.destroyed)) {
+                return;
+            }
+            if (canonicalHp > 0 && !verifiedRequiredBossDestroy) {
+                destroyedEntity.dead = false;
+                if (Number(destroyedEntity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                    destroyedEntity.entState = EntityState.ACTIVE;
+                }
+                const localEntity = client.entities.get(rawEntityId) ?? client.entities.get(entityId) ?? {};
+                const localHp = Math.max(0, Math.round(Number(localEntity?.hp ?? healthState?.maxHp ?? canonicalHp)));
+                const correctionDelta = canonicalHp - localHp;
+                if (correctionDelta !== 0) {
+                    client.send(
+                        CombatHandler.CLIENT_HEAL_PACKET_ID,
+                        CombatHandler.buildHpDeltaPayload(rawEntityId, correctionDelta)
+                    );
+                }
+                client.send(
+                    0x07,
+                    CombatHandler.buildEntityStatePayload(
+                        rawEntityId,
+                        Number(destroyedEntity.entState ?? EntityState.ACTIVE),
+                        Boolean(destroyedEntity.facingLeft)
+                    )
+                );
+                return;
+            }
+
+            if (verifiedRequiredBossDestroy && healthState) {
+                CombatHandler.syncHostileHealthCopies(levelScope, destroyedEntity, 0, healthState.maxHp);
+                for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, destroyedEntity, true)) {
+                    copy.clientDefeatVerified = true;
+                    copy.playerDamageContributed = true;
+                }
+                noteDungeonRunKill(levelScope, contributionSnapshot!.contributors, entityId, destroyedEntity);
+            }
+
+            CombatHandler.finalizeHostileDeath(client, levelScope, entityId, destroyedEntity, {
+                includeAnchor: true,
+                sendHpCorrection: false,
+                reason: 'client_destroy_dead_canonical'
+            });
+            if (usesSharedDungeonProgress(getScopeLevelName(levelScope))) {
+                noteSharedDungeonHostileDestroyed(levelScope, entityId, destroyedEntity);
+                LevelHandler.scheduleSharedDungeonQuestProgressRefresh(levelScope, { reason: 'canonical_hostile_destroy' });
+            }
+            if (shouldProcessDefeatState) {
+                CombatHandler.handleEnemyDefeatState(client, levelScope, entityId, destroyedEntity, { fromDestroy: true });
+            }
+            CombatHandler.relayPartyLocalEntityDefeat(
+                client,
+                levelScope,
+                entityId,
+                destroyedEntity,
+                { includeAnchor: true, sendHpCorrection: false }
+            );
+            return;
+        }
+
+        if (shouldProcessDefeatState && destroyedEntity) {
+            destroyedEntity.hp = 0;
+            destroyedEntity.dead = true;
+            destroyedEntity.destroyed = true;
+            destroyedEntity.entState = EntityState.DEAD;
+        }
 
         if (levelName === 'CraftTownTutorial' && client.keepTutorialState) {
             const entityName = String(destroyedEntity?.name ?? '');
@@ -3507,6 +6051,9 @@ export class CombatHandler {
             if (usesSharedDungeonProgress(getScopeLevelName(levelScope)) && destroyedEntity) {
                 noteSharedDungeonHostileDestroyed(levelScope, entityId, destroyedEntity);
             }
+            if (CombatHandler.isServerAuthoritySyncNpc(levelScope, destroyedEntity)) {
+                EntityHandler.noteServerAuthorityHostileDestroyed(levelScope, entityId, destroyedEntity);
+            }
             const levelMap = GlobalState.levelEntities.get(levelScope);
             levelMap?.delete(entityId);
             if (levelMap && levelMap.size === 0) {
@@ -3518,7 +6065,10 @@ export class CombatHandler {
             CombatHandler.noteEntityDestroyed(levelScope, entityId);
             EntityHandler.forgetKnownEntity(levelName, entityId, client.levelInstanceId);
             if (usesSharedDungeonProgress(getScopeLevelName(levelScope)) && destroyedEntity) {
-                LevelHandler.refreshSharedDungeonQuestProgress(levelScope);
+                LevelHandler.scheduleSharedDungeonQuestProgressRefresh(levelScope, { reason: 'entity_destroy' });
+                if (EntityHandler.usesServerAuthorityHostiles(getScopeLevelName(levelScope))) {
+                    CombatHandler.refreshServerAuthorityProgressWithRetries(levelScope, 'entity_destroy');
+                }
             }
         }
 
@@ -3531,23 +6081,23 @@ export class CombatHandler {
             CombatHandler.handleEnemyDefeatState(client, levelScope, entityId, destroyedEntity, { fromDestroy: true });
         }
 
-        if (shouldProcessDefeatState && destroyedEntity && !destroyedEntity.isPlayer) {
-            const authorityToken = resolveSharedDungeonProgressAuthorityToken(levelScope);
-            const authorityClient = authorityToken > 0 ? GlobalState.sessionsByToken.get(authorityToken) : null;
-            const completionClient = authorityClient && areClientsInSameLevelScope(client, authorityClient)
-                ? authorityClient
-                : client;
-            CombatHandler.fireAndForgetMissionWork(
-                client,
-                'forced dungeon objective completion',
-                () => MissionHandler.handleForcedDungeonObjectiveCompletion(completionClient, destroyedEntity)
-            );
-        }
-
         if (shouldRelayDestroy) {
-            CombatHandler.broadcastToSameLevel(levelScope, 0x0D, destroyPayload, [], client);
+            if (CombatHandler.isServerAuthoritySyncNpc(levelScope, destroyedEntity)) {
+                CombatHandler.broadcastServerAuthorityNpcDestroy(client, levelScope, entityId, destroyedEntity, true);
+            } else {
+                CombatHandler.broadcastToSameLevel(levelScope, 0x0D, destroyPayload, [], client);
+            }
         } else if (shouldMirrorClientSpawnEntity) {
-            CombatHandler.relayPartyLocalEntityDefeat(client, levelScope, entityId);
+            CombatHandler.relayPartyLocalEntityDefeat(
+                client,
+                levelScope,
+                entityId,
+                destroyedEntity,
+                {
+                    includeAnchor: !EntityHandler.usesServerAuthorityHostiles(levelName),
+                    sendHpCorrection: false
+                }
+            );
         }
     }
 
@@ -3558,12 +6108,15 @@ export class CombatHandler {
         const hadPendingRespawn = Boolean(client.pendingRespawnRequest);
         if (usePotion) {
             usePotion = CombatHandler.tryConsumeRespawnPotion(client);
+            // 0x77 and the 0x82 that follows it are two halves of one revive, and the
+            // gap between them is the combat-stats handshake -- unbounded, and routinely
+            // longer than the 1.5s dedup window inside tryConsumeRespawnPotion. Mark the
+            // charge so the broadcast half cannot bill a second potion for it.
+            client.respawnPotionCharged = client.respawnPotionCharged || usePotion;
         }
 
         if (!usePotion && !hadPendingRespawn) {
             noteDungeonRunDeath(client);
-            client.processedRewardSources.clear();
-            CombatHandler.clearLevelEnemyRewardTrackingForRespawn(client);
             CombatHandler.notePlayerDeathState(client);
         }
 
@@ -3577,14 +6130,28 @@ export class CombatHandler {
 
     static handleRespawnBroadcast(client: Client, data: Buffer): void {
         const br = new BitReader(data);
-        const entId = br.readMethod9();
+        const rawEntId = br.readMethod9();
+        const entId = EntityHandler.resolveEntityAlias(client, rawEntId);
         const clientHealAmount = Math.max(0, Math.round(br.readMethod24()));
         const usedPotion = br.readMethod15();
-        if (usedPotion) {
+        if (usedPotion && !client.respawnPotionCharged) {
             CombatHandler.tryConsumeRespawnPotion(client);
         }
+        client.respawnPotionCharged = false;
 
         const isSelfRespawn = entId === client.clientEntID;
+        const levelScope = getClientLevelScope(client);
+        const respawnEntity = client.currentLevel ? CombatHandler.resolveLevelEntity(levelScope, entId) : null;
+        if (!isSelfRespawn && CombatHandler.isServerAuthoritySyncNpc(levelScope, respawnEntity)) {
+            CombatHandler.correctServerAuthorityHostileProxy(
+                client,
+                levelScope,
+                respawnEntity,
+                'hostile_respawn_rejected',
+                rawEntId
+            );
+            return;
+        }
         const healAmount = isSelfRespawn
             ? Math.max(clientHealAmount, CombatHandler.getRespawnHealAmount(client))
             : clientHealAmount;
@@ -3600,7 +6167,7 @@ export class CombatHandler {
         }
 
         if (client.currentLevel) {
-            const levelEntity = CombatHandler.resolveLevelEntity(getClientLevelScope(client), entId);
+            const levelEntity = CombatHandler.resolveLevelEntity(levelScope, entId);
             if (levelEntity && typeof levelEntity === 'object') {
                 levelEntity.dead = false;
                 levelEntity.entState = EntityState.ACTIVE;
@@ -3611,12 +6178,11 @@ export class CombatHandler {
             }
         }
 
-        const levelScope = getClientLevelScope(client);
         if (usesSharedDungeonProgress(getScopeLevelName(levelScope))) {
             const levelEntity = CombatHandler.resolveLevelEntity(levelScope, entId);
             if (levelEntity && !levelEntity.isPlayer) {
                 noteSharedDungeonHostileState(levelScope, entId, levelEntity);
-                LevelHandler.refreshSharedDungeonQuestProgress(levelScope);
+                LevelHandler.scheduleSharedDungeonQuestProgressRefresh(levelScope, { reason: 'entity_respawn' });
             }
         }
 
@@ -3651,32 +6217,177 @@ export class CombatHandler {
         }
 
         const levelEntity = CombatHandler.resolveLevelEntity(levelScope, entityId);
-        const targetEntity = entity ?? levelEntity;
+        const targetEntity = levelEntity ?? entity;
+        const rejectLivingBossRegen = Boolean(
+            amount > 0 &&
+            DungeonCompletionConditions.requiresBossDefeatSignal(getScopeLevelName(levelScope)) &&
+            DungeonCompletionConditions.isRequiredBoss(getScopeLevelName(levelScope), targetEntity, levelScope) &&
+            (
+                CombatHandler.hasLivingPlayerInHostileRoom(levelScope, targetEntity) ||
+                !CombatHandler.isPlayerSessionDead(client)
+            )
+        );
+        if (rejectLivingBossRegen) {
+            // The client applies its local regen tick before reporting it. Undo
+            // that visible heal while keeping the canonical boss HP unchanged.
+            client.send(
+                CombatHandler.CLIENT_HEAL_PACKET_ID,
+                CombatHandler.buildHpDeltaPayload(rawEntityId, -amount)
+            );
+            return true;
+        }
+
+        if (EntityHandler.usesServerAuthorityHostiles(getScopeLevelName(levelScope))) {
+            if (CombatHandler.isServerAuthoritySyncNpc(levelScope, targetEntity)) {
+                const canonicalId = Math.max(0, Math.round(Number(targetEntity.id ?? entityId)));
+                if (CombatHandler.isTerminalHostileEntity(targetEntity)) {
+                    CombatHandler.relayServerAuthorityNpcDeath(
+                        client,
+                        levelScope,
+                        targetEntity
+                    );
+                    return true;
+                }
+                if (Math.round(Number(targetEntity.hp ?? 0)) > 0) {
+                    targetEntity.dead = false;
+                    if (Number(targetEntity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                        targetEntity.entState = EntityState.ACTIVE;
+                    }
+                }
+                EntityHandler.normalizeServerAuthorityHostileState(levelScope, targetEntity);
+                const currentHp = Math.max(0, Math.round(Number(targetEntity.hp ?? 0)));
+                if (!CombatHandler.isCanonicalHostileTerminal(levelScope, targetEntity)) {
+                    const viewers = CombatHandler.broadcastAuthoritativeServerAuthorityHp(
+                        client,
+                        levelScope,
+                        targetEntity,
+                        'client_hostile_hp_report'
+                    );
+                    if (Math.round(Number(targetEntity.hp ?? 0)) <= CombatHandler.DEATH_EPSILON_HP || amount < 0) {
+                    }
+                    CombatHandler.sendServerAuthorityAliveCorrection(client, levelScope, targetEntity, 'client_hostile_hp_report', rawEntityId);
+                } else {
+                    CombatHandler.relayServerAuthorityNpcDeath(client, levelScope, targetEntity);
+                    return true;
+                }
+                CombatHandler.convergeServerAuthorityNpcHealthToParty(
+                    client,
+                    levelScope,
+                    targetEntity,
+                    'client_hostile_hp_report',
+                    rawEntityId
+                );
+                return true;
+            }
+            return true;
+        }
+
+        if (
+            targetEntity &&
+            !Boolean(targetEntity?.isPlayer) &&
+            Number(targetEntity?.team ?? 0) === EntityTeam.ENEMY &&
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), targetEntity)
+        ) {
+            const canonicalId = Math.max(0, Math.round(Number(targetEntity.id ?? entityId)));
+            if (CombatHandler.isTerminalHostileEntity(targetEntity)) {
+                CombatHandler.relayPartyLocalEntityDefeat(
+                    client,
+                    levelScope,
+                    canonicalId,
+                    targetEntity,
+                    { requireKnownOrLocal: false, sendHpCorrection: false, includeAnchor: true }
+                );
+                return true;
+            }
+
+            const healthState = CombatHandler.resolveHostileHealthStateAcrossCopies(levelScope, targetEntity) ??
+                CombatHandler.getNpcHealthState(targetEntity, levelScope);
+            if (!healthState || healthState.maxHp <= 0) {
+                return true;
+            }
+
+            if (amount < 0) {
+                for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, targetEntity, true)) {
+                    copy.playerDamageContributed = true;
+                }
+            }
+
+            if (CombatHandler.completeRequiredBossFromClientHpReport(
+                client,
+                levelScope,
+                rawEntityId,
+                canonicalId,
+                targetEntity,
+                healthState,
+                amount
+            )) {
+                return true;
+            }
+
+            const snapshots = CombatHandler.snapshotPartySharedHostileViewerHealth(client, levelScope, targetEntity);
+            if (healthState.currentHp > 0) {
+                targetEntity.dead = false;
+                if (Number(targetEntity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                    targetEntity.entState = EntityState.ACTIVE;
+                }
+            }
+            CombatHandler.convergePartySharedHostileHealthToParty(
+                client,
+                levelScope,
+                targetEntity,
+                snapshots,
+                0,
+                0
+            );
+
+            return true;
+        }
+
         if (
             !targetEntity ||
             Boolean(targetEntity?.isPlayer) ||
             Number(targetEntity?.team ?? 0) !== EntityTeam.ENEMY ||
-            !CombatHandler.isDungeonBossEntity(levelScope, targetEntity)
+            (
+                !CombatHandler.isDungeonBossEntity(levelScope, targetEntity) &&
+                !MissionHandler.shouldProcessEnemyKillStateDungeonCompletion(client, targetEntity)
+            )
         ) {
             return false;
         }
 
         const healthState = CombatHandler.resolveHostileHealthStateAcrossCopies(levelScope, targetEntity);
         if (!healthState || healthState.maxHp <= 0) {
-            CombatHandler.logBossRegen('boss-hp-report-skip', levelScope, targetEntity, {
-                reason: 'no-health',
-                rawEntityId,
-                entityId,
-                amount,
-                player: String(client.character?.name ?? 'unknown').replace(/\s+/g, '_')
-            });
             return true;
         }
 
-        const authoritativeKill = healthState.authoritativeKill &&
-            !CombatHandler.shouldDeferPowerHitKillToClient(levelScope, targetEntity);
-        const minHp = authoritativeKill ? 0 : 1;
-        const nextHp = Math.max(minHp, Math.min(healthState.maxHp, healthState.currentHp + amount));
+        if (amount < 0) {
+            for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, targetEntity, true)) {
+                copy.playerDamageContributed = true;
+            }
+        }
+
+        if (CombatHandler.completeRequiredBossFromClientHpReport(
+            client,
+            levelScope,
+            rawEntityId,
+            entityId,
+            targetEntity,
+            healthState,
+            amount
+        )) {
+            return true;
+        }
+
+        if (CombatHandler.isTerminalHostileEntity(targetEntity)) {
+            return true;
+        }
+
+        if (healthState.currentHp > 0) {
+            targetEntity.dead = false;
+            if (Number(targetEntity.entState ?? EntityState.ACTIVE) === EntityState.DEAD) {
+                targetEntity.entState = EntityState.ACTIVE;
+            }
+        }
 
         if (amount < 0) {
             const nowMs = Date.now();
@@ -3685,22 +6396,118 @@ export class CombatHandler {
                 CombatHandler.setEntityLastRegenTickAt(copy, 0);
             }
         }
+        return true;
+    }
 
-        if (nextHp !== healthState.currentHp) {
-            CombatHandler.applyNpcHealthState(targetEntity, healthState.maxHp, nextHp, authoritativeKill);
-            CombatHandler.syncHostileHealthCopies(levelScope, targetEntity, nextHp, healthState.maxHp);
+    private static completeRequiredBossFromClientHpReport(
+        client: Client,
+        levelScope: string,
+        rawEntityId: number,
+        entityId: number,
+        targetEntity: any,
+        healthState: { maxHp: number; currentHp: number; authoritativeKill: boolean },
+        amount: number
+    ): boolean {
+        if (!MissionHandler.shouldCompleteDungeonFromBossHpReport(client, targetEntity)) {
+            MissionHandler.logRejectedBossHpReport(client, targetEntity, amount, healthState.currentHp);
+            return false;
         }
 
-        CombatHandler.logBossRegen('boss-hp-report', levelScope, targetEntity, {
+        const lifeNonce = Math.max(0, Math.round(Number(targetEntity?.lifeNonce ?? 0)));
+        const bossRecord = getBossAuthorityRecord(levelScope, targetEntity);
+        if (Math.round(Number(targetEntity?.clientReportedDamageLifeNonce ?? -1)) !== lifeNonce) {
+            targetEntity.clientReportedDamageLifeNonce = lifeNonce;
+            targetEntity.clientReportedDamageByToken = new Map<number, number>();
+            bossRecord?.reportedDamageByToken.clear();
+        }
+        // A boss the scope owns keeps one ledger for the whole run. The copy-local
+        // map it replaces reset itself every time a client re-registered its copy,
+        // which is how a party member walking back into the room handed the boss a
+        // fresh health bar that nobody else could see.
+        const reportedDamageByToken = bossRecord
+            ? bossRecord.reportedDamageByToken
+            : targetEntity.clientReportedDamageByToken instanceof Map
+                ? targetEntity.clientReportedDamageByToken as Map<number, number>
+                : new Map<number, number>();
+        targetEntity.clientReportedDamageByToken = reportedDamageByToken;
+        for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, targetEntity, true)) {
+            copy.clientReportedDamageLifeNonce = lifeNonce;
+            copy.clientReportedDamageByToken = reportedDamageByToken;
+        }
+        const sourceToken = Math.max(0, Math.round(Number(client.token ?? 0)));
+        const previousReportedDamage = Math.max(0, Math.round(Number(reportedDamageByToken.get(sourceToken) ?? 0)));
+        const nextReportedDamage = Math.max(
+            0,
+            Math.min(healthState.maxHp, previousReportedDamage - amount)
+        );
+        reportedDamageByToken.set(sourceToken, nextReportedDamage);
+        const totalReportedDamage = Math.min(
+            healthState.maxHp,
+            [...reportedDamageByToken.values()].reduce(
+                (total, reported) => total + Math.max(0, Math.round(Number(reported ?? 0))),
+                0
+            )
+        );
+
+        if (amount >= 0) {
+            return false;
+        }
+
+        const reportedNextHp = Math.max(
+            0,
+            Math.min(healthState.maxHp, Math.round(healthState.currentHp + amount))
+        );
+        if (reportedNextHp > 0 && totalReportedDamage < healthState.maxHp) {
+            return false;
+        }
+
+        // Some authored bosses emit HP telemetry before their actual defeat
+        // transition. Keep the telemetry for validation, but let the later
+        // entity-destroy signal commit completion so the room cannot end while
+        // the boss is still visibly alive.
+        if (MissionHandler.shouldDeferBossHpCompletionUntilDefeatSignal(client)) {
+            return false;
+        }
+
+        if (CombatHandler.hasDerivedHostileHealthPool(levelScope, targetEntity, healthState.maxHp)) {
+            CombatHandler.logDeferredDerivedPoolBossKill(levelScope, targetEntity, healthState, totalReportedDamage);
+            return false;
+        }
+
+        const canonicalId = Math.max(0, Math.round(Number(targetEntity?.id ?? entityId)));
+        CombatHandler.syncHostileHealthCopies(levelScope, targetEntity, 0, healthState.maxHp);
+        const completedEntity = CombatHandler.resolveLevelEntity(levelScope, canonicalId) ?? targetEntity;
+        for (const copy of CombatHandler.collectHostileHealthCopies(levelScope, completedEntity, true)) {
+            copy.clientDefeatVerified = true;
+            copy.playerDamageContributed = true;
+        }
+        completedEntity.clientDefeatVerified = true;
+        completedEntity.playerDamageContributed = true;
+
+        const contributorKey = getClientCharacterKey(client);
+        if (contributorKey) {
+            noteDungeonRunKill(levelScope, [contributorKey], canonicalId, completedEntity);
+        }
+        if (usesSharedDungeonProgress(getScopeLevelName(levelScope))) {
+            noteSharedDungeonHostileDestroyed(levelScope, canonicalId, completedEntity);
+            LevelHandler.refreshSharedDungeonQuestProgress(levelScope);
+        }
+        CombatHandler.handleEnemyDefeatState(
+            client,
+            levelScope,
+            canonicalId,
+            completedEntity,
+            { fromKillState: true }
+        );
+        console.log('[CombatHandler] Verified required dungeon boss from client HP report', {
+            scope: levelScope,
+            sourceToken: client.token,
             rawEntityId,
-            entityId,
-            amount,
+            canonicalId,
+            name: String(completedEntity?.name ?? ''),
             previousHp: healthState.currentHp,
-            nextHp,
-            maxHp: healthState.maxHp,
-            authoritativeKill,
-            player: String(client.character?.name ?? 'unknown').replace(/\s+/g, '_')
-        }, 0);
+            amount
+        });
         return true;
     }
 
@@ -3716,18 +6523,15 @@ export class CombatHandler {
         );
         const entity = client.entities.get(entityId) ?? CombatHandler.resolveLevelEntity(levelScope, entityId);
         if (!EntityHandler.isClientOwnPlayerEntity(client, levelScope, entityId, entity)) {
+            if (amount < 0 && entity && !entity.isPlayer && Boolean(entity.untargetable)) {
+                return;
+            }
+            // Damage reported against a hostile is player-initiated by definition, so the cutscene
+            // lock has no business dropping it. The untargetable guard above still covers bosses
+            // that are meant to be invulnerable through their intro.
             if (CombatHandler.recordClientHostileHpDelta(client, levelScope, rawEntityId, entityId, entity, amount)) {
                 return;
             }
-            CombatHandler.logPlayerHp('client-hp-ignored', client, {
-                reason: 'not-own-player',
-                rawEntityId,
-                entityId,
-                amount,
-                entityHp: Math.round(Number(entity?.hp ?? 0)),
-                authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-                authMax: Math.round(Number(client.authoritativeMaxHp ?? 0))
-            }, CombatHandler.PLAYER_HP_LOG_THROTTLE_MS);
             return;
         }
 
@@ -3735,30 +6539,13 @@ export class CombatHandler {
         const maxHp = CombatHandler.resolvePlayerMaxHp(client, entity, levelEntity);
         const currentHp = CombatHandler.resolvePlayerCurrentHp(client, entity, levelEntity, maxHp);
         const nextHp = Math.max(0, Math.min(maxHp, currentHp + amount));
-        CombatHandler.logPlayerHp('client-hp-report', client, {
-            rawEntityId,
-            entityId,
-            amount,
-            previousHp: currentHp,
-            nextHp,
-            maxHp,
-            entityHp: Math.round(Number(entity?.hp ?? 0)),
-            levelHp: Math.round(Number(levelEntity?.hp ?? 0)),
-            authHp: Math.round(Number(client.authoritativeCurrentHp ?? 0)),
-            authMax: Math.round(Number(client.authoritativeMaxHp ?? 0)),
-            lastCombatAt: Math.max(0, client.lastCombatActivityAt),
-            lastTickAt: Math.max(0, client.lastCombatRegenTickAt)
-        });
+        const appliedDelta = nextHp - currentHp;
         if (nextHp <= 0) {
             CombatHandler.notePlayerDeathState(client);
-            CombatHandler.logPlayerHp('client-hp-death', client, {
-                rawEntityId,
-                entityId,
-                amount,
-                previousHp: currentHp,
-                nextHp,
-                maxHp
-            });
+            if (appliedDelta !== 0) {
+                CombatHandler.broadcastPlayerHpDelta(client, appliedDelta, false);
+            }
+            CombatHandler.broadcastPlayerState(client, EntityState.DEAD);
             return;
         }
 
@@ -3782,15 +6569,185 @@ export class CombatHandler {
 
         client.authoritativeMaxHp = maxHp;
         client.authoritativeCurrentHp = nextHp;
+        if (appliedDelta !== 0) {
+            CombatHandler.broadcastPlayerHpDelta(client, appliedDelta, false);
+        }
         if (amount < 0) {
             CombatHandler.notePlayerDamageTakenActivity(client, Date.now());
-            CombatHandler.logPlayerHp('damage-timer-start', client, {
-                currentHp: nextHp,
-                maxHp,
-                damage: Math.abs(amount),
-                lastCombatAt: Math.max(0, client.lastCombatActivityAt),
-                lastTickAt: Math.max(0, client.lastCombatRegenTickAt)
-            });
+        }
+    }
+
+    private static getServerAuthorityActiveBuffs(entity: any): Record<string, ServerAuthorityBuffSnapshot> {
+        if (!entity || typeof entity !== 'object') {
+            return {};
+        }
+
+        const existing = entity.activeBuffs && typeof entity.activeBuffs === 'object' && !Array.isArray(entity.activeBuffs)
+            ? entity.activeBuffs as Record<string, ServerAuthorityBuffSnapshot>
+            : {};
+        entity.activeBuffs = existing;
+        return existing;
+    }
+
+    private static getServerAuthorityBuffPacketKey(data: Buffer): string {
+        const trailingHex = CombatHandler.trailingBitsAfterLeadingMethod9Hex(data);
+        return trailingHex || data.toString('hex');
+    }
+
+    private static parseServerAuthorityBuffPayload(data: Buffer): {
+        targetId: number;
+        buffId: number;
+        durationMs: number;
+        uncertain: boolean;
+    } {
+        const parsed = {
+            targetId: 0,
+            buffId: 0,
+            durationMs: 0,
+            uncertain: true
+        };
+
+        try {
+            const br = new BitReader(data);
+            parsed.targetId = br.readMethod4();
+            parsed.buffId = br.remainingBits() > 0 ? br.readMethod4() : 0;
+            if (br.remainingBits() <= 0) {
+                return parsed;
+            }
+
+            const rawDuration = Math.max(0, Math.round(br.readMethod24()));
+            if (rawDuration <= 0) {
+                return parsed;
+            }
+
+            parsed.durationMs = rawDuration >= 1000 ? rawDuration : rawDuration * 1000;
+            parsed.uncertain = true;
+            return parsed;
+        } catch {
+            return parsed;
+        }
+    }
+
+    private static mirrorServerAuthorityBuffStateToViewerCache(
+        viewer: Client,
+        canonicalId: number,
+        entity: any
+    ): void {
+        const localId = EntityHandler.resolveEntityLocalId(viewer, canonicalId);
+        const localEntity = viewer.entities.get(localId) ?? viewer.entities.get(canonicalId);
+        if (!localEntity || typeof localEntity !== 'object') {
+            return;
+        }
+
+        localEntity.activeBuffs = { ...(entity?.activeBuffs ?? {}) };
+        localEntity.buffStateVersion = Math.max(0, Math.round(Number(entity?.buffStateVersion ?? 0)));
+        localEntity.lastBuffStateAt = Math.max(0, Math.round(Number(entity?.lastBuffStateAt ?? 0)));
+        viewer.entities.set(localId > 0 ? localId : canonicalId, localEntity);
+    }
+
+    private static recordServerAuthorityBuffPacket(
+        client: Client,
+        packetId: number,
+        data: Buffer
+    ): { payload: Buffer; referencedEntityIds: number[] } {
+        const rawTargetId = CombatHandler.parseBuffTargetEntityId(data);
+        const parsedBuff = CombatHandler.parseServerAuthorityBuffPayload(data);
+        const levelScope = getClientLevelScope(client);
+        const canonicalTargetId = CombatHandler.resolveClientHostileEntityAlias(
+            client,
+            levelScope,
+            EntityHandler.resolveEntityAlias(client, rawTargetId)
+        );
+        if (packetId !== 0x0B) {
+        }
+        const payload = rawTargetId > 0 && canonicalTargetId > 0 && rawTargetId !== canonicalTargetId
+            ? CombatHandler.replaceLeadingMethod9(data, canonicalTargetId)
+            : data;
+        const entity = CombatHandler.resolveLevelEntity(levelScope, canonicalTargetId);
+        if (
+            !CombatHandler.isServerAuthoritySyncNpc(levelScope, entity) &&
+            !CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), entity)
+        ) {
+            return {
+                payload,
+                referencedEntityIds: CombatHandler.parseReferencedEntityIds(packetId, payload)
+            };
+        }
+
+        const key = CombatHandler.getServerAuthorityBuffPacketKey(payload);
+        const activeBuffs = CombatHandler.getServerAuthorityActiveBuffs(entity);
+        const nowMs = Date.now();
+        if (packetId === 0x0B) {
+            if (parsedBuff.durationMs <= 0) {
+            }
+            activeBuffs[key] = {
+                key,
+                packetId,
+                targetId: canonicalTargetId,
+                buffId: parsedBuff.buffId,
+                durationMs: parsedBuff.durationMs,
+                expiresAt: parsedBuff.durationMs > 0 ? nowMs + parsedBuff.durationMs : 0,
+                sourceToken: Math.max(0, Math.round(Number(client.token ?? 0))),
+                sourceName: String(client.character?.name ?? ''),
+                payloadHex: payload.toString('hex'),
+                updatedAt: nowMs
+            };
+        } else {
+            delete activeBuffs[key];
+        }
+
+        entity.buffStateVersion = Math.max(0, Math.round(Number(entity.buffStateVersion ?? 0))) + 1;
+        entity.lastBuffStateAt = nowMs;
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (getClientLevelScope(viewer) !== levelScope) {
+                continue;
+            }
+            CombatHandler.mirrorServerAuthorityBuffStateToViewerCache(viewer, canonicalTargetId, entity);
+        }
+
+        return {
+            payload,
+            referencedEntityIds: [canonicalTargetId]
+        };
+    }
+
+    static processBuffExpirations(levelScope: string, nowMs: number = Date.now()): void {
+        if (!levelScope) {
+            return;
+        }
+
+        const levelMap = GlobalState.levelEntities.get(levelScope);
+        if (!levelMap) {
+            return;
+        }
+
+        for (const entity of levelMap.values()) {
+            if (!entity || entity.isPlayer || Number(entity.team ?? 0) !== EntityTeam.ENEMY) {
+                continue;
+            }
+
+            const activeBuffs = CombatHandler.getServerAuthorityActiveBuffs(entity);
+            const expired = Object.values(activeBuffs).filter((snapshot) =>
+                Math.max(0, Math.round(Number(snapshot.expiresAt ?? 0))) > 0 &&
+                Math.max(0, Math.round(Number(snapshot.expiresAt ?? 0))) <= nowMs
+            );
+            if (expired.length === 0) {
+                continue;
+            }
+
+            for (const snapshot of expired) {
+                CombatHandler.broadcastCanonicalBuffRemoval(levelScope, entity, snapshot, 'buff_expired');
+                delete activeBuffs[snapshot.key];
+            }
+
+            entity.buffStateVersion = Math.max(0, Math.round(Number(entity.buffStateVersion ?? 0))) + 1;
+            entity.lastBuffStateAt = nowMs;
+            const canonicalId = Math.max(0, Math.round(Number(entity.id ?? 0)));
+        for (const viewer of GlobalState.getSessionsInLevelScope(levelScope)) {
+                if (getClientLevelScope(viewer) === levelScope) {
+                    CombatHandler.mirrorServerAuthorityBuffStateToViewerCache(viewer, canonicalId, entity);
+                }
+            }
         }
     }
 
@@ -3803,23 +6760,69 @@ export class CombatHandler {
 
         const rawTargetId = info.targetId;
         const rawSourceId = info.sourceId;
-        info.targetId = EntityHandler.resolveEntityAlias(client, rawTargetId);
-        info.sourceId = EntityHandler.resolveEntityAlias(client, rawSourceId);
+        const levelScope = getClientLevelScope(client);
+        info.targetId = CombatHandler.resolveClientHostileEntityAlias(
+            client,
+            levelScope,
+            EntityHandler.resolveEntityAlias(client, rawTargetId)
+        );
+        info.sourceId = CombatHandler.resolveClientHostileEntityAlias(
+            client,
+            levelScope,
+            EntityHandler.resolveEntityAlias(client, rawSourceId)
+        );
+        // Same as handlePowerHit: only hostile-sourced ticks pause for the cutscene. Blocking every
+        // tick killed the player's poison/DoT stacks (Plague Battalion) during boss dialogue.
+        if (CombatHandler.shouldSuppressCutsceneHostileCombat(client, levelScope, info.sourceId)) {
+            return;
+        }
 
         const { targetId, sourceId, damage } = info;
-        const levelScope = getClientLevelScope(client);
         const targetEntity = CombatHandler.resolveLevelEntity(levelScope, targetId);
-        const sourceEntity = CombatHandler.resolveLevelEntity(levelScope, sourceId);
+        const sourceEntity = CombatHandler.resolvePowerCastSourceEntity(levelScope, sourceId, client);
         const isHostileNpcSource = Boolean(
             sourceEntity &&
             !sourceEntity.isPlayer &&
             Number(sourceEntity.team ?? 0) === EntityTeam.ENEMY
         );
+        if (targetEntity && CombatHandler.isTerminalHostileEntity(targetEntity)) {
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.isTerminalHostileEntity(sourceEntity)) {
+            const sourceCanonicalId = Math.max(0, Math.round(Number(sourceEntity?.id ?? sourceId)));
+            if (
+                sourceCanonicalId > 0 &&
+                CombatHandler.shouldMirrorClientSpawnEntityToParty(getScopeLevelName(levelScope), sourceEntity)
+            ) {
+                CombatHandler.relayPartyLocalEntityDefeat(
+                    client,
+                    levelScope,
+                    sourceCanonicalId,
+                    sourceEntity,
+                    { requireKnownOrLocal: false, sendHpCorrection: false, includeAnchor: true }
+                );
+            }
+            CombatHandler.sendPostDeathSourceCorrection(client, levelScope, sourceEntity, rawSourceId, 'buff-tick-dot-source');
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.shouldSuppressDeadPartySharedHostileAction(client, levelScope, sourceEntity, 'buff_tick_dot')) {
+            return;
+        }
+        if (isHostileNpcSource && CombatHandler.shouldSuppressNonAuthorityPartySharedHostileAction(client, levelScope, sourceEntity)) {
+            return;
+        }
         if (targetEntity && !targetEntity.isPlayer && Boolean(targetEntity.untargetable)) {
             return;
         }
 
         const sourceSession = CombatHandler.resolveCombatSourceSession(levelScope, sourceId, client);
+        const targetSession = CombatHandler.findPlayerSessionByEntityId(levelScope, targetId);
+        if (
+            (!targetEntity && !targetSession) ||
+            !CombatHandler.isAuthorizedNetworkCombatSource(client, levelScope, sourceId, sourceSession, sourceEntity)
+        ) {
+            return;
+        }
         if (CombatHandler.shouldSuppressForeignOwnedHit(client, sourceSession, isHostileNpcSource)) {
             return;
         }
@@ -3850,10 +6853,76 @@ export class CombatHandler {
             Number(targetEntity.team ?? 0) === EntityTeam.ENEMY &&
             MissionHandler.shouldProcessEnemyKillStateDungeonCompletion(client, targetEntity)
         );
+        const partySharedHostileSnapshots = targetEntity &&
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(client.currentLevel, targetEntity)
+            ? CombatHandler.snapshotPartySharedHostileViewerHealth(sourceSession ?? client, levelScope, targetEntity)
+            : new Map<number, HostileViewerHealthSnapshot>();
+        CombatHandler.assignPartySharedHostileCombatAuthority(levelScope, targetEntity, sourceSession ?? client);
+        const hpBefore = Math.max(0, Math.round(Number(targetEntity?.hp ?? 0)));
         const resolution = CombatHandler.updateNpcTargetAfterHit(levelScope, targetId, damage);
+        if (resolution.entity && Math.max(0, Math.round(Number(resolution.appliedDamage ?? 0))) > 0) {
+            TutorialDungeonMechanics.noteBossHealth(sourceSession ?? client, resolution.entity);
+            if (CombatHandler.isServerAuthoritySyncNpc(levelScope, resolution.entity)) {
+                CombatHandler.broadcastAuthoritativeServerAuthorityHp(
+                    sourceSession ?? client,
+                    levelScope,
+                    resolution.entity,
+                    'buff-tick-dot'
+                );
+            }
+        }
+        if (resolution.entity && CombatHandler.isServerAuthoritySyncNpc(levelScope, resolution.entity)) {
+            CombatHandler.rememberServerAuthorityProxyHpApply(
+                levelScope,
+                Math.max(0, Math.round(Number(resolution.entity.id ?? targetId)))
+            );
+            CombatHandler.convergeServerAuthorityNpcHealthToParty(
+                client,
+                levelScope,
+                resolution.entity,
+                'buff_tick_dot',
+                rawTargetId
+            );
+            if (resolution.killed) {
+                if (!deferDungeonCompletionUntilDestroy) {
+                    CombatHandler.handleEnemyDefeatState(sourceSession ?? client, levelScope, targetId, resolution.entity);
+                }
+                CombatHandler.relayServerAuthorityNpcDeath(client, levelScope, resolution.entity);
+            }
+            return;
+        }
+        if (
+            resolution.entity &&
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(client.currentLevel, resolution.entity)
+        ) {
+            const appliedDamage = Math.max(0, Math.round(Number(resolution.appliedDamage ?? 0)));
+            CombatHandler.rememberPartySharedHostileHpApply(
+                levelScope,
+                Math.max(0, Math.round(Number(resolution.entityId ?? resolution.entity.id ?? targetId)))
+            );
+            CombatHandler.convergePartySharedHostileHealthToParty(
+                sourceSession ?? client,
+                levelScope,
+                resolution.entity,
+                partySharedHostileSnapshots,
+                -appliedDamage,
+                -appliedDamage
+            );
+        }
         if (resolution.killed && resolution.entity && !deferDungeonCompletionUntilDestroy) {
             CombatHandler.handleEnemyDefeatState(sourceSession ?? client, levelScope, targetId, resolution.entity);
         }
+        const partySharedHostileDeathRelay = (
+            resolution.killed &&
+            resolution.entity &&
+            CombatHandler.shouldMirrorClientSpawnEntityToParty(client.currentLevel, resolution.entity)
+        )
+            ? {
+                entityId: Math.max(0, Math.round(Number(resolution.entityId ?? targetId))),
+                entity: resolution.entity,
+                anchor: sourceSession ?? client
+            }
+            : null;
 
         const relayPayload = info.targetId === rawTargetId && info.sourceId === rawSourceId
             ? data
@@ -3862,17 +6931,39 @@ export class CombatHandler {
         CombatHandler.broadcastCombatPacket(client, 0x79, relayPayload, {
             referencedEntityIds: [targetId, sourceId]
         });
+        if (partySharedHostileDeathRelay) {
+            CombatHandler.relayPartyLocalEntityDefeat(
+                partySharedHostileDeathRelay.anchor,
+                levelScope,
+                partySharedHostileDeathRelay.entityId,
+                partySharedHostileDeathRelay.entity,
+                { requireKnownOrLocal: true, sendHpCorrection: false, includeAnchor: true }
+            );
+        }
     }
 
     static async handleAddBuff(client: Client, data: Buffer): Promise<void> {
-        CombatHandler.broadcastCombatPacket(client, 0x0B, data, {
-            referencedEntityIds: CombatHandler.parseReferencedEntityIds(0x0B, data)
+        const rawTargetId = CombatHandler.parseBuffTargetEntityId(data);
+        const levelScope = getClientLevelScope(client);
+        const targetId = CombatHandler.resolveClientHostileEntityAlias(
+            client,
+            levelScope,
+            EntityHandler.resolveEntityAlias(client, rawTargetId)
+        );
+        const targetEntity = CombatHandler.resolveLevelEntity(levelScope, targetId);
+        if (targetEntity && CombatHandler.isTerminalHostileEntity(targetEntity)) {
+            return;
+        }
+        const recorded = CombatHandler.recordServerAuthorityBuffPacket(client, 0x0B, data);
+        CombatHandler.broadcastCombatPacket(client, 0x0B, recorded.payload, {
+            referencedEntityIds: recorded.referencedEntityIds
         });
     }
 
     static async handleRemoveBuff(client: Client, data: Buffer): Promise<void> {
-        CombatHandler.broadcastCombatPacket(client, 0x0C, data, {
-            referencedEntityIds: CombatHandler.parseReferencedEntityIds(0x0C, data)
+        const recorded = CombatHandler.recordServerAuthorityBuffPacket(client, 0x0C, data);
+        CombatHandler.broadcastCombatPacket(client, 0x0C, recorded.payload, {
+            referencedEntityIds: recorded.referencedEntityIds
         });
     }
 }

@@ -1,6 +1,11 @@
 import { Client, clearKeepTutorialTimers, createKeepTutorialState } from '../core/Client';
 import { CharacterTemplates } from '../core/CharacterTemplates';
 import { DungeonEntryDisplay } from '../core/DungeonEntryDisplay';
+import {
+    clearStoredDungeonSnapshot,
+    getStoredDungeonSnapshot,
+    StoredDungeonSnapshot
+} from '../core/DungeonSnapshot';
 import { GameData } from '../core/GameData';
 import { BitBuffer } from '../network/protocol/bitBuffer';
 import { BitReader } from '../network/protocol/bitReader';
@@ -22,7 +27,6 @@ import { PetHandler } from './PetHandler';
 import { BuildingHandler } from './BuildingHandler';
 import { ForgeHandler } from './ForgeHandler';
 import { TalentHandler } from './TalentHandler';
-import { DebugLogger } from '../core/Debug';
 import { syncClientDungeonRunState } from '../core/DungeonRunStats';
 import { ensureCharacterSocialState, normalizeCharacterKey } from '../core/SocialState';
 import { getPartyIdForClient, areClientsInSameParty } from '../core/PartySync';
@@ -38,6 +42,8 @@ import {
     normalizeLevelInstanceId
 } from '../core/LevelScope';
 import { getCharacterRuntimeLevel, getPartyRuntimeLevelForClient } from '../core/RuntimeLevel';
+import { RegionPositionPersistence } from '../core/RegionPositionPersistence';
+import { LegendsInn } from '../core/LegendsInn';
 
 const db = new JsonAdapter();
 
@@ -71,6 +77,79 @@ export class CharacterHandler {
         }
 
         client.characters = await db.saveCharacterSnapshot(client.userId, client.character);
+    }
+
+    private static resolveTransferTokenAlias(token: number): number {
+        let resolvedToken = Math.max(0, Math.round(Number(token) || 0));
+        const visitedTokens = new Set<number>([resolvedToken]);
+
+        while (resolvedToken > 0) {
+            const nextToken = GlobalState.transferTokenAliases.get(resolvedToken);
+            if (!nextToken || nextToken <= 0 || visitedTokens.has(nextToken)) {
+                return resolvedToken;
+            }
+
+            resolvedToken = Math.max(0, Math.round(Number(nextToken) || 0));
+            visitedTokens.add(resolvedToken);
+        }
+
+        return resolvedToken;
+    }
+
+    private static resolvePendingGameLogin(
+        client: Client,
+        loginToken: number
+    ): { token: number; entry: PendingTransfer; source: string } | null {
+        const normalizedToken = Math.max(0, Math.round(Number(loginToken) || 0));
+        if (normalizedToken <= 0) {
+            return null;
+        }
+
+        const directEntry = GlobalState.pendingWorld.get(normalizedToken);
+        if (directEntry) {
+            return { token: normalizedToken, entry: directEntry, source: 'direct' };
+        }
+
+        const aliasedToken = CharacterHandler.resolveTransferTokenAlias(normalizedToken);
+        if (aliasedToken !== normalizedToken) {
+            const aliasedEntry = GlobalState.pendingWorld.get(aliasedToken);
+            if (aliasedEntry) {
+                return { token: aliasedToken, entry: aliasedEntry, source: `alias:${normalizedToken}->${aliasedToken}` };
+            }
+        }
+
+        const userId = Math.max(0, Math.round(Number(client.userId ?? 0) || 0));
+        const characterKey = normalizeCharacterKey(client.character?.name);
+        const anchorCandidates = Array.from(GlobalState.pendingWorld.entries())
+            .filter(([, entry]) => {
+                const syncAnchorToken = Math.max(0, Math.round(Number(entry.syncAnchorToken ?? 0) || 0));
+                if (syncAnchorToken !== normalizedToken || !LevelConfig.isDungeonLevel(entry.targetLevel)) {
+                    return false;
+                }
+                if (userId > 0 && Math.max(0, Math.round(Number(entry.userId ?? 0) || 0)) !== userId) {
+                    return false;
+                }
+                if (characterKey && normalizeCharacterKey(entry.character?.name) !== characterKey) {
+                    return false;
+                }
+                return true;
+            })
+            .sort((left, right) => {
+                const leftStarted = Math.max(0, Math.round(Number(left[1].playSessionStartedAt ?? 0) || 0));
+                const rightStarted = Math.max(0, Math.round(Number(right[1].playSessionStartedAt ?? 0) || 0));
+                return leftStarted - rightStarted || left[0] - right[0];
+            });
+
+        const anchorCandidate = anchorCandidates[0];
+        if (!anchorCandidate) {
+            return null;
+        }
+
+        return {
+            token: anchorCandidate[0],
+            entry: anchorCandidate[1],
+            source: `sync-anchor:${normalizedToken}->${anchorCandidate[0]}`
+        };
     }
 
     private static initializeFreshCharacterProgress(character: Character): void {
@@ -118,32 +197,30 @@ export class CharacterHandler {
         return TransferTokenAllocator.allocate(targetLevel);
     }
 
-    private static isVisitedCraftTownPendingTransfer(entry: PendingTransfer): boolean {
-        if (entry.targetLevel !== 'CraftTown' || !entry.craftTownHostCharacter) {
-            return false;
-        }
-
-        const visitorKey = normalizeCharacterKey(entry.character.name);
-        const hostKey = normalizeCharacterKey(entry.craftTownHostCharacter.name);
-        return Boolean(visitorKey && hostKey && visitorKey !== hostKey);
-    }
-
     private static shouldSendExtendedPlayerData(
         firstLogin: boolean,
         pendingExtended: boolean,
-        entry: PendingTransfer
+        _entry: PendingTransfer
     ): boolean {
-        return firstLogin || pendingExtended || CharacterHandler.isVisitedCraftTownPendingTransfer(entry);
+        return firstLogin || pendingExtended;
     }
 
     private static repairUnsafeSavedDungeonLocation(character: Character): boolean {
+        const storedDungeonSnapshot = getStoredDungeonSnapshot(character);
+        if (storedDungeonSnapshot) {
+            return false;
+        }
+
+        let didMutate = character.DungeonSnapshot !== undefined
+            ? clearStoredDungeonSnapshot(character)
+            : false;
         const safeReturn = LevelConfig.resolveDungeonSafeReturn(
             character.CurrentLevel?.name,
             undefined,
             character
         );
         if (!safeReturn) {
-            return false;
+            return didMutate;
         }
 
         character.CurrentLevel = {
@@ -151,11 +228,12 @@ export class CharacterHandler {
             x: safeReturn.x,
             y: safeReturn.y
         };
-        return true;
+        didMutate = true;
+        return didMutate;
     }
 
     private static isSessionStale(session: Client): boolean {
-        return session.socket.destroyed || session.socket.readyState !== 'open';
+        return !GlobalState.isClientConnectionOpen(session);
     }
 
     private static purgeSameCharacterGhosts(activeClient: Client, userId: number, characterName: string): void {
@@ -288,16 +366,31 @@ export class CharacterHandler {
             if (ensureSigilStoreAlertState(client.character)) {
                 client.characters = await db.saveCharacterSnapshot(client.userId, client.character);
             }
-            DebugLogger.logProgress('CharacterReload:loaded', client, loadedCharacter, {
-                source: 'disk'
-            });
             return;
         }
 
         client.characters = CharacterHandler.upsertCharacterList(loadedCharacters, client.character);
-        DebugLogger.logProgress('CharacterReload:missingOnDisk', client, client.character, {
-            source: 'memory'
-        });
+    }
+
+    private static resolveEnterWorldSpawn(
+        character: Character,
+        previousLevelName: string,
+        currentLevelName: string,
+        storedDungeonSnapshot: StoredDungeonSnapshot | null
+    ): { x: number; y: number; hasCoord: boolean } {
+        if (
+            storedDungeonSnapshot?.hasCoord &&
+            Number.isFinite(Number(storedDungeonSnapshot.x)) &&
+            Number.isFinite(Number(storedDungeonSnapshot.y))
+        ) {
+            return {
+                x: Math.round(Number(storedDungeonSnapshot.x)),
+                y: Math.round(Number(storedDungeonSnapshot.y)),
+                hasCoord: true
+            };
+        }
+
+        return LevelConfig.getSpawnCoordinates(character, previousLevelName, currentLevelName);
     }
 
     private static buildPaperDollPacket(character: Character): BitBuffer {
@@ -612,10 +705,13 @@ export class CharacterHandler {
             const currentPrimary = Number(colors[0] ?? 0);
             const currentSecondary = Number(colors[1] ?? 0);
 
-            if (nextPrimary > 0 && nextPrimary !== currentPrimary) {
+            // A dye id of 0 is "back to undyed", which the Default Dyes button stages and
+            // charges for like any other change. Counting only `next > 0` would let the
+            // client show a price the server never collects, and the two golds would drift.
+            if (nextPrimary !== currentPrimary) {
                 changedUnits += 1;
             }
-            if (nextSecondary > 0 && nextSecondary !== currentSecondary) {
+            if (nextSecondary !== currentSecondary) {
                 changedUnits += 1;
             }
         }
@@ -748,16 +844,6 @@ export class CharacterHandler {
 
         client.sendBitBuffer(0x1A, CharacterHandler.buildPaperDollPacket(character));
         CharacterHandler.broadcastLookUpdate(client);
-
-        DebugLogger.logProgress('CharacterLookChange:saved', client, character, {
-            headSet,
-            mouthSet,
-            hairSet,
-            faceSet,
-            gender,
-            hairColor: Number(hairColor ?? 0),
-            skinColor: Number(skinColor ?? 0)
-        });
     }
 
     static async handleLoginCharacterCreate(client: Client, data: Buffer): Promise<void> {
@@ -874,7 +960,10 @@ export class CharacterHandler {
             return;
         }
 
-        const didRepairUnsafeLocation = CharacterHandler.repairUnsafeSavedDungeonLocation(char);
+        let didRepairUnsafeLocation = CharacterHandler.repairUnsafeSavedDungeonLocation(char);
+        if (char.DungeonSnapshot !== undefined && !getStoredDungeonSnapshot(char)) {
+            didRepairUnsafeLocation = clearStoredDungeonSnapshot(char) || didRepairUnsafeLocation;
+        }
         if (didRepairUnsafeLocation) {
             client.characters = CharacterHandler.upsertCharacterList(client.characters, char);
             await db.saveCharacters(client.userId, client.characters);
@@ -884,16 +973,33 @@ export class CharacterHandler {
         await BuildingHandler.syncCompletionState(client);
         await ForgeHandler.syncCompletionState(client);
         console.log(`[CharacterSelect] Selected ${char.name}`);
-        
+
+        if (
+            client.account &&
+            await LoginHandler.replaceAndWarnActiveAccountIdentityConflicts(client, client.account, char.name)
+        ) {
+            return;
+        }
+
         CharacterHandler.sendEnterWorld(client, char);
     }
 
     private static sendEnterWorld(client: Client, char: Character): void {
         CharacterHandler.repairUnsafeSavedDungeonLocation(char);
+        const storedDungeonSnapshot = getStoredDungeonSnapshot(char);
+
+        // Put the character back where they last stood in the open world. This runs after the
+        // dungeon repair and only when there is no dungeon snapshot to honour, so a player who
+        // logged out mid-dungeon still resumes by the dungeon's own rules; it only covers the
+        // ordinary case, which is the one that was dropping people at a stale coordinate.
+        if (!storedDungeonSnapshot) {
+            RegionPositionPersistence.restore(char);
+        }
 
         // Determine Level
-        const currentLevelName = char.CurrentLevel?.name || "NewbieRoad";
+        const currentLevelName = storedDungeonSnapshot?.levelName || char.CurrentLevel?.name || "NewbieRoad";
         const previousLevelName =
+            storedDungeonSnapshot?.entryLevel ||
             LevelConfig.resolveDungeonEntryLevel(
                 currentLevelName,
                 char.PreviousLevel?.name || "NewbieRoad",
@@ -901,7 +1007,7 @@ export class CharacterHandler {
             ) ||
             char.PreviousLevel?.name ||
             "NewbieRoad";
-        const spawn = LevelConfig.getSpawnCoordinates(char, previousLevelName, currentLevelName);
+        let spawn = CharacterHandler.resolveEnterWorldSpawn(char, previousLevelName, currentLevelName, storedDungeonSnapshot);
         const isDungeonLevel = LevelConfig.isDungeonLevel(currentLevelName);
 
         // Generate Transfer Token
@@ -911,16 +1017,21 @@ export class CharacterHandler {
         if (client.userId) {
              // For dungeon levels, try to find a party member already in the same dungeon
              // and reuse their levelInstanceId so both players share the same level scope.
-             let levelInstanceId = currentLevelName === 'CraftTown'
+             let levelInstanceId = storedDungeonSnapshot?.levelInstanceId ||
+                (currentLevelName === 'CraftTown'
                 ? getCraftTownHomeInstanceId(char)
-                : '';
-             let syncAnchorStartedAt: number | undefined = isDungeonLevel ? Date.now() : undefined;
+                : '');
+             let syncAnchorStartedAt: number | undefined = isDungeonLevel
+                ? storedDungeonSnapshot?.syncAnchorStartedAt ?? storedDungeonSnapshot?.savedAt ?? Date.now()
+                : undefined;
              let syncAnchorToken: number | undefined = isDungeonLevel ? token : undefined;
              let syncAnchorCharacterName: string | undefined = isDungeonLevel ? char.name : undefined;
-             let syncRoomId: number | undefined;
-             let syncStartedRoomIds: number[] | undefined;
-             let syncEntryLevel: string | undefined;
-             let syncQuestProgress: number | undefined;
+             let syncRoomId: number | undefined = storedDungeonSnapshot?.currentRoomId;
+             let syncStartedRoomIds: number[] | undefined = storedDungeonSnapshot
+                ? [...storedDungeonSnapshot.startedRoomIds]
+                : undefined;
+             let syncEntryLevel: string | undefined = storedDungeonSnapshot?.entryLevel;
+             let syncQuestProgress: number | undefined = storedDungeonSnapshot?.questProgress;
 
              if (isDungeonLevel) {
                  const normalizedTarget = LevelConfig.normalizeLevelName(currentLevelName);
@@ -933,6 +1044,22 @@ export class CharacterHandler {
 
                      // Found a party member in the same dungeon — reuse their level scope
                      levelInstanceId = normalizeLevelInstanceId(other.levelInstanceId) || createDungeonInstanceId(token);
+                     // Only ever onto a standing anchor. Their live entity mid-jump is a
+                     // point in open air, and spawning onto it drops the joiner; when the
+                     // anchor has no grounded sample yet the level's own spawn marker wins.
+                     //
+                     // Onto, not beside: the server has no collision, so an offset is a
+                     // guess about floor it cannot check, and next to a ledge or a pit that
+                     // guess drops the joiner through the map.
+                     const otherEntity = other.clientEntID > 0 ? other.entities?.get(other.clientEntID) : null;
+                     const anchorGround = LevelHandler.resolveGroundedAnchorPosition(otherEntity, normalizedTarget);
+                     if (anchorGround) {
+                         spawn = {
+                             x: anchorGround.x,
+                             y: anchorGround.y,
+                             hasCoord: true
+                         };
+                     }
                      syncAnchorStartedAt = other.syncAnchorStartedAt > 0 ? other.syncAnchorStartedAt : Date.now();
                      syncAnchorToken = other.syncAnchorToken > 0 ? other.syncAnchorToken : token;
                      syncAnchorCharacterName = String(other.syncAnchorCharacterName || other.character.name).trim();
@@ -940,10 +1067,10 @@ export class CharacterHandler {
                      // Room progress replay causes null errors in the Flash client when
                      // it receives room event start packets before the level SWF is loaded.
                      // Room progress will sync naturally as the Flash client loads rooms.
-                     syncEntryLevel = LevelConfig.normalizeLevelName(other.entryLevel) || undefined;
-                     syncQuestProgress = Number.isFinite(Number(other.character.questTrackerState))
+                     syncEntryLevel = syncEntryLevel || LevelConfig.normalizeLevelName(other.entryLevel) || undefined;
+                     syncQuestProgress = syncQuestProgress ?? (Number.isFinite(Number(other.character.questTrackerState))
                          ? Math.max(0, Math.min(100, Math.round(Number(other.character.questTrackerState))))
-                         : undefined;
+                         : undefined);
                      console.log(`[EnterWorld] Syncing dungeon instance for ${char.name} with party anchor ${other.character.name} (instanceId=${levelInstanceId})`);
                      break;
                  }
@@ -969,6 +1096,9 @@ export class CharacterHandler {
                 syncRoomId,
                 syncStartedRoomIds,
                 syncEntryLevel,
+                syncEntryX: storedDungeonSnapshot?.entryHasCoord ? storedDungeonSnapshot.entryX : undefined,
+                syncEntryY: storedDungeonSnapshot?.entryHasCoord ? storedDungeonSnapshot.entryY : undefined,
+                syncEntryHasCoord: Boolean(storedDungeonSnapshot?.entryHasCoord),
                 syncQuestProgress,
                 playSessionStartedAt: Date.now()
             });
@@ -978,15 +1108,18 @@ export class CharacterHandler {
         // Get Level Config
         const levelSpec = LevelConfig.get(currentLevelName);
         const isHard = currentLevelName.endsWith("Hard");
-        const runtimeMapLevel = CharacterHandler.resolveDungeonMapPacketLevel(currentLevelName, levelSpec.mapId, char, client);
+        // The entry plate reads mapLevel + mBonusLevels, so hand it the level the
+        // dungeon presents as rather than the one its monsters fight at.
+        const runtimeMapLevel = LegendsInn.adjustDisplayMapLevel(
+            currentLevelName,
+            CharacterHandler.resolveDungeonMapPacketLevel(currentLevelName, levelSpec.mapId, char, client)
+        );
         const runtimeBaseLevel = levelSpec.baseId;
 
-        const pendingEntry = GlobalState.pendingWorld.get(token);
-        const resolvedTransferToken = pendingEntry?.syncAnchorToken || token;
         const momentParams = DungeonEntryDisplay.buildMomentParams(currentLevelName, isHard ? "Hard" : "");
 
         const pkt = WorldEnter.buildEnterWorldPacket(
-            resolvedTransferToken, // Ensure Flash client uses the Host's token for Room Event Generation Offset
+            token,
             0, "", false, 0, 0,
             Config.HOST,
             Config.PORTS[0],
@@ -1003,15 +1136,6 @@ export class CharacterHandler {
             char
         );
 
-        DebugLogger.logProgress('EnterWorld:initialPacket', client, char, {
-            transferToken: resolvedTransferToken,
-            targetLevel: currentLevelName,
-            targetSwf: levelSpec.swf,
-            previousLevel: previousLevelName,
-            previousSwf: '',
-            sendExtended: true
-        });
-
         // Store token mapping for persistence
         if (client.userId) {
             GlobalState.tokenChar.set(token, { character: char, userId: client.userId });
@@ -1023,15 +1147,19 @@ export class CharacterHandler {
 
     static async handleGameServerLogin(client: Client, data: Buffer): Promise<void> {
         const br = new BitReader(data);
-        const token = br.readMethod9();
+        const loginToken = br.readMethod9();
         const levelSwf = br.readMethod26(); 
         const firstLogin = br.readMethod15();
         const isDev = br.readMethod15();
 
-        const entry = GlobalState.pendingWorld.get(token);
-        if (!entry) {
-            console.log(`[GameLogin] Invalid token ${token}`);
+        const pendingLogin = CharacterHandler.resolvePendingGameLogin(client, loginToken);
+        if (!pendingLogin) {
+            console.log(`[GameLogin] Invalid token ${loginToken}`);
             return;
+        }
+        const { token, entry } = pendingLogin;
+        if (token !== loginToken) {
+            console.log(`[GameLogin] Resolved login token ${loginToken} -> pending token ${token} (${pendingLogin.source})`);
         }
 
         const pendingExtended = Boolean(GlobalState.pendingExtended.get(token));
@@ -1049,6 +1177,14 @@ export class CharacterHandler {
         client.token = token;
         client.clientEntID = 0;
         client.currentLevel = entry.targetLevel;
+        console.log("========== PLAYER ENTERED LEVEL ==========");
+        console.log("Target level:", entry.targetLevel);
+        console.log("Client currentLevel:", client.currentLevel);
+        console.log("Character:", client.character?.name);
+        console.log("Is dungeon:", LevelConfig.isDungeonLevel(client.currentLevel));
+        console.log("==========================================");
+
+
         client.levelInstanceId = entry.targetLevel === 'CraftTown'
             ? normalizeLevelInstanceId(entry.levelInstanceId) || getCraftTownHomeInstanceId(entry.character, entry.craftTownHostCharacter)
             : LevelConfig.isDungeonLevel(entry.targetLevel)
@@ -1108,12 +1244,20 @@ export class CharacterHandler {
         client.pendingLoot.clear();
         client.processedRewardSources.clear();
         syncClientDungeonRunState(client);
+        const transferCompanionState = {
+            equippedMount: entry.character?.equippedMount,
+            activePet: entry.character?.activePet ? { ...entry.character.activePet } : undefined,
+            restingPets: Array.isArray(entry.character?.restingPets)
+                ? entry.character.restingPets.map((pet: any) => ({ ...pet }))
+                : []
+        };
 
         if (entry.targetLevel === 'CraftTownTutorial') {
             LevelHandler.resetCraftTownTutorialInstance();
         }
 
         await CharacterHandler.reloadCurrentCharacterFromSave(client);
+        const companionRepairDidMutate = PetHandler.syncEquippedCompanionState(client.character, transferCompanionState);
         await BuildingHandler.syncCompletionState(client);
         await ForgeHandler.syncCompletionState(client);
         TalentHandler.syncResearchTimer(client);
@@ -1123,34 +1267,12 @@ export class CharacterHandler {
         const abilityRepairDidMutate = AbilityHandler.repairCharacterAbilityState(client.character);
         const storyRepair = MissionHandler.repairEarlyStoryOnLogin(client.character, entry.targetLevel);
         const expectedLevelSwf = LevelConfig.get(entry.targetLevel).swf;
-        if ((socialRepairDidMutate || abilityRepairDidMutate || storyRepair.didMutate) && client.userId) {
+        if ((companionRepairDidMutate || socialRepairDidMutate || abilityRepairDidMutate || storyRepair.didMutate) && client.userId) {
             client.characters = CharacterHandler.upsertCharacterList(client.characters, client.character);
             void db.saveCharacters(client.userId, client.characters);
         }
 
-        DebugLogger.logProgress('GameLogin:ready', client, client.character, {
-            token,
-            firstLogin,
-            sendExtended,
-            levelSwf,
-            expectedLevelSwf,
-            levelSwfMatchesTarget: levelSwf === expectedLevelSwf,
-            isDev,
-            storyRepairDidMutate: storyRepair.didMutate,
-            storyRepairAddedMissionId: storyRepair.addedMissionId,
-            socialRepairDidMutate,
-            abilityRepairDidMutate
-        });
-
         if (levelSwf !== expectedLevelSwf) {
-            DebugLogger.logProgress('GameLogin:swfMismatch', client, client.character, {
-                token,
-                targetLevel: entry.targetLevel,
-                expectedLevelSwf,
-                clientLevelSwf: levelSwf,
-                firstLogin,
-                sendExtended
-            });
         }
 
         CharacterHandler.purgeSameCharacterGhosts(client, entry.userId, entry.character.name);
@@ -1176,6 +1298,9 @@ export class CharacterHandler {
             syncAnchorToken: client.syncAnchorToken > 0 ? client.syncAnchorToken : undefined,
             syncAnchorCharacterName: client.syncAnchorCharacterName || undefined,
             syncEntryLevel: entry.syncEntryLevel,
+            syncEntryX: entry.syncEntryX,
+            syncEntryY: entry.syncEntryY,
+            syncEntryHasCoord: entry.syncEntryHasCoord,
             syncRoomId: entry.syncRoomId,
             syncStartedRoomIds: entry.syncStartedRoomIds,
             syncQuestProgress: client.syncQuestProgress,
@@ -1200,34 +1325,26 @@ export class CharacterHandler {
         await MissionHandler.prepareFullClearDungeonEntry(client);
 
         // Send Player Data (0x10)
-        const buildingStateCharacter = isVisitingAnotherPlayersCraftTown(client)
-            ? client.craftTownHostCharacter
-            : null;
         const pdPkt = WorldEnter.buildPlayerDataPacket(
             client.character,
             token,
-            0, 
             0,
+            // mBonusLevels. The only thing that decides how much health a
+            // client-spawned hostile has - see LegendsInn.getMonsterBonusLevels.
+            LegendsInn.getMonsterBonusLevels(entry.targetLevel),
             entry.targetLevel,
             spawn.x,
             spawn.y,
             spawn.hasCoord,
-            sendExtended,
-            buildingStateCharacter
+            sendExtended
         );
         const pdBuffer = pdPkt.toBuffer();
 
         client.send(0x10, pdBuffer);
         console.log(`[GameLogin] Sent 0x10 (Player Data)`);
-        DebugLogger.logProgress('GameLogin:sentPlayerData', client, client.character, {
-            token,
-            sendExtended,
-            targetLevel: entry.targetLevel,
-            payloadLength: pdBuffer.length,
-            payloadPreview: DebugLogger.previewBuffer(pdBuffer)
-        });
 
         MissionHandler.syncMissionStateToClient(client);
+        MissionHandler.syncFullClearDungeonEntryMissionToClient(client);
         CharacterHandler.sendBootstrappedStoryMission(client, storyRepair.addedMissionId);
 
         SocialHandler.handleSessionReady(client);

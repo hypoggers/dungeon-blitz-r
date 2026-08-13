@@ -44,8 +44,7 @@ export class LevelConfig {
     private static LEVEL_NAME_CANONICAL: Record<string, string> = {};
     private static LEVEL_NAME_COMPACT_CANONICAL: Record<string, string> = {};
     private static readonly NON_DUNGEON_OVERRIDES = new Set([
-        'CraftTown',
-        'CraftTownTutorial'
+        'CraftTown'
     ]);
     private static readonly LEVEL_ALIASES: Record<string, string> = {
         "blackrosemire": "SwampRoadNorth",
@@ -118,12 +117,13 @@ export class LevelConfig {
         };
     }
 
-    private static isMissingAuthoredSpawn(levelName: string, x: number, y: number): boolean {
-        return (
-            (levelName === 'CemeteryHill' || levelName === 'CemeteryHillHard') &&
-            Math.round(Number(x)) === 0 &&
-            Math.round(Number(y)) === 0
-        );
+    // A 0,0 record is a placeholder, never a position a player stood on. It means either
+    // the level has an authored spawn that should have been used instead (the Cemetery
+    // Hill case this started as), or it has none and only the client knows where the
+    // level's spawn marker is. Either way the coordinates must not be replayed -- doing
+    // so drops the player at the world origin.
+    private static isMissingAuthoredSpawn(_levelName: string, x: number, y: number): boolean {
+        return Math.round(Number(x)) === 0 && Math.round(Number(y)) === 0;
     }
 
     private static hasDefaultSpawn(levelName: string): boolean {
@@ -320,6 +320,13 @@ export class LevelConfig {
         return this.LEVELS[levelName] || { swf: "", mapId: 0, baseId: 0, isDungeon: false, isHard: false };
     }
 
+    static getDungeonLevelNames(): string[] {
+        return Object.entries(this.LEVELS)
+            .filter(([levelName, spec]) => spec.isDungeon && !this.NON_DUNGEON_OVERRIDES.has(levelName))
+            .map(([levelName]) => levelName)
+            .sort();
+    }
+
     static has(levelName: string): boolean {
         return Boolean(levelName) && Boolean(this.LEVELS[levelName]);
     }
@@ -378,6 +385,21 @@ export class LevelConfig {
         return this.DOOR_MAP.get(key) || this.DOOR_FALLBACKS[key] || null;
     }
 
+    static getDungeonEntranceDoorId(
+        dungeonLevelName: string | null | undefined,
+        entryLevelName: string | null | undefined
+    ): number | null {
+        const dungeonLevel = this.normalizeLevelName(dungeonLevelName);
+        const entryLevel = this.normalizeLevelName(entryLevelName);
+        if (!dungeonLevel || !entryLevel || !this.isDungeonLevel(dungeonLevel)) {
+            return null;
+        }
+
+        const doorEntry = (this.DOOR_ENTRIES_BY_TARGET.get(dungeonLevel) ?? [])
+            .find((entry) => entry.sourceLevel === entryLevel);
+        return doorEntry ? Math.round(doorEntry.sourceDoorId) : null;
+    }
+
     private static getDoorTravelSpawn(
         currentLevel: string,
         targetLevel: string,
@@ -414,6 +436,52 @@ export class LevelConfig {
             return false;
         }
         return Boolean(this.LEVELS[normalized]?.isDungeon);
+    }
+
+    // Dread runs reuse the normal dungeon's SWF and the normal `EntTypes`
+    // entries: `SwampKingHard` carries exactly the same `Level` and `HitPoints`
+    // as `SwampKing`. The extra difficulty comes from the level itself, whose
+    // `mapId` sits a fixed number of tiers above the normal level's `baseId`
+    // (+15, +25 or +35 depending on the region). Anything that sizes a hostile
+    // from its EntType level has to add this offset, or the server models a
+    // Dread enemy with its normal-mode health pool.
+    static getHardDungeonEnemyLevelOffset(levelName: string | null | undefined): number {
+        const normalized = this.normalizeLevelName(levelName);
+        const spec = normalized ? this.LEVELS[normalized] : null;
+        if (!spec?.isHard || !spec.isDungeon) {
+            return 0;
+        }
+
+        return Math.max(0, Math.round(spec.mapId - spec.baseId));
+    }
+
+    // Which row of the hostile health table an enemy is sized from.
+    //
+    // Outside a Dread run this is the entity's own runtime level, which dungeons
+    // stamp with the party's highest player level so enemies keep up with the
+    // party. A Dread run cannot be expressed on that scale: the jump is authored
+    // on the level, and a party already at 50 has no room left above it, so
+    // adding the offset to the runtime level ran every hostile off the end of the
+    // table and clamped it back to tier 50. That is why Dread Goblin Camp handed
+    // its boss 403,680 HP — the same pool the normal-mode boss gets — while the
+    // trash around it was pinned to the level-50 row as well.
+    //
+    // So a Dread tier is absolute: the EntType's authored level plus the level's
+    // jump, exactly the pool the difficulty was designed around. Every non-Dread
+    // level has a zero offset and keeps sizing hostiles the way it always did.
+    static getHostileHpTier(
+        levelName: string | null | undefined,
+        runtimeLevel: number,
+        entTypeLevel: number
+    ): number {
+        const fallbackTier = Math.round(Number(runtimeLevel) || 1);
+        const dreadOffset = this.getHardDungeonEnemyLevelOffset(levelName);
+        if (dreadOffset <= 0) {
+            return fallbackTier;
+        }
+
+        const authoredTier = Math.round(Number(entTypeLevel) || 0);
+        return (authoredTier > 0 ? authoredTier : fallbackTier) + dreadOffset;
     }
 
     static isPersistentDungeonLevel(levelName: string | null | undefined): boolean {
@@ -505,32 +573,11 @@ export class LevelConfig {
             return { x: 0, y: 0, hasCoord: false };
         }
 
-        const currentRecord = this.asLevelRecord(char?.CurrentLevel);
-        if (
-            this.normalizeLevelName(currentRecord.name) === entryLevel &&
-            Number.isFinite(currentRecord.x) &&
-            Number.isFinite(currentRecord.y) &&
-            !this.isMissingAuthoredSpawn(entryLevel, Number(currentRecord.x), Number(currentRecord.y))
-        ) {
-            return {
-                x: Math.round(Number(currentRecord.x)),
-                y: Math.round(Number(currentRecord.y)),
-                hasCoord: true
-            };
-        }
-
-        const previousRecord = this.asLevelRecord(char?.PreviousLevel);
-        if (
-            this.normalizeLevelName(previousRecord.name) === entryLevel &&
-            Number.isFinite(previousRecord.x) &&
-            Number.isFinite(previousRecord.y) &&
-            !this.isMissingAuthoredSpawn(entryLevel, Number(previousRecord.x), Number(previousRecord.y))
-        ) {
-            return {
-                x: Math.round(Number(previousRecord.x)),
-                y: Math.round(Number(previousRecord.y)),
-                hasCoord: true
-            };
+        // Where the dungeon spits the player back out. Same rule as every other spawn: only a
+        // point the client reported standing on, never a dead-reckoned one.
+        const confirmed = this.getConfirmedSpawnForLevel(char, entryLevel);
+        if (confirmed) {
+            return { x: confirmed.x, y: confirmed.y, hasCoord: true };
         }
 
         if (this.hasDefaultSpawn(entryLevel)) {
@@ -577,26 +624,79 @@ export class LevelConfig {
         return this.DOOR_SPAWNS.get(this.getDoorKey(level, Math.round(id))) ?? null;
     }
 
+    /**
+     * The floor point the client itself reported standing on in this level, or null.
+     *
+     * `GroundedSpawns` is written in exactly one place -- EntityHandler, off a standing self
+     * full update -- because that is the only packet carrying a position the server did not
+     * compute for itself. See the note at the top of core/GroundedPosition.ts: everything else
+     * is `entity.x/y`, a sum of deltas on top of whatever the server *believed* the spawn point
+     * was, and the client corrects that belief silently whenever it snaps a body onto floor or
+     * lets one fall.
+     *
+     * That belief being wrong is the whole bug. It compounds: a coordinate that put the player
+     * in open air is replayed on the next entry, they fall again, the fall is summed onto the
+     * same wrong base, and the record drifts further every visit. It is how a live CraftTown
+     * record reached y=-349 with the floor at 1460.
+     */
+    static getConfirmedSpawnForLevel(char: any, levelName: string): { x: number; y: number } | null {
+        const level = this.normalizeLevelName(levelName);
+        const table = char?.GroundedSpawns;
+        if (!level || !table || typeof table !== 'object') {
+            return null;
+        }
+
+        // Stored under the normalized name, but tolerate an older casing.
+        const record = table[level]
+            ?? Object.entries(table).find(([key]) => this.normalizeLevelName(key) === level)?.[1];
+        const x = Number((record as any)?.x);
+        const y = Number((record as any)?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || this.isMissingAuthoredSpawn(level, x, y)) {
+            return null;
+        }
+
+        return { x: Math.round(x), y: Math.round(y) };
+    }
+
+    /**
+     * Remember a confirmed floor point for a level, replacing whatever was there.
+     *
+     * Keyed by level rather than kept as a single "last position" because a player who walks
+     * out of a dungeon has to be put back on the town coordinate they left from, not on
+     * whatever map they were on most recently.
+     */
+    static rememberConfirmedSpawn(char: any, levelName: string, x: number, y: number): boolean {
+        const level = this.normalizeLevelName(levelName);
+        const numericX = Math.round(Number(x));
+        const numericY = Math.round(Number(y));
+        if (
+            !char ||
+            !level ||
+            !Number.isFinite(numericX) ||
+            !Number.isFinite(numericY) ||
+            // 0,0 is the placeholder every reset writes; storing it would make the record look
+            // real while pointing at the world origin.
+            this.isMissingAuthoredSpawn(level, numericX, numericY)
+        ) {
+            return false;
+        }
+
+        if (!char.GroundedSpawns || typeof char.GroundedSpawns !== 'object') {
+            char.GroundedSpawns = {};
+        }
+        char.GroundedSpawns[level] = { x: numericX, y: numericY, at: Date.now() };
+        return true;
+    }
+
     private static getSavedCoordinatesForLevel(
         char: any,
         levelName: string
     ): { x: number; y: number; hasCoord: boolean } | null {
-        for (const record of [this.asLevelRecord(char?.CurrentLevel), this.asLevelRecord(char?.PreviousLevel)]) {
-            if (
-                this.normalizeLevelName(record.name) === levelName &&
-                Number.isFinite(record.x) &&
-                Number.isFinite(record.y) &&
-                !this.isMissingAuthoredSpawn(levelName, Number(record.x), Number(record.y))
-            ) {
-                return {
-                    x: Math.round(Number(record.x)),
-                    y: Math.round(Number(record.y)),
-                    hasCoord: true
-                };
-            }
-        }
-
-        return null;
+        // Only a confirmed point. CurrentLevel/PreviousLevel are dead-reckoned and used to be
+        // read here; replaying one is what dropped players in from the air on the way out of a
+        // dungeon. With none, the caller falls through to the authored spawn, which is floor.
+        const confirmed = this.getConfirmedSpawnForLevel(char, levelName);
+        return confirmed ? { ...confirmed, hasCoord: true } : null;
     }
 
     static resolveDungeonSafeReturn(
@@ -628,6 +728,17 @@ export class LevelConfig {
             { fallbackLevel: dungeonLevel === 'TutorialDungeon' ? 'NewbieRoad' : 'NewbieRoad' }
         );
 
+        // Dungeons never write CurrentLevel/PreviousLevel, so the character still carries the
+        // last position they stood on in the region they came from -- the place they expect to
+        // be put back on. Overwriting that with a derived entry point loses it for no gain: the
+        // entry point is a coordinate the server reconstructed, the saved record is one the
+        // player actually stood on. The saved region position wins, and the entry point stays
+        // as the fallback for a character that has none.
+        const savedCoordinates = this.getSavedCoordinatesForLevel(char, safeLevel);
+        if (savedCoordinates) {
+            return { level: safeLevel, ...savedCoordinates };
+        }
+
         const entryX = Number(entryCoords?.x);
         const entryY = Number(entryCoords?.y);
         if (entryCoords?.hasCoord && Number.isFinite(entryX) && Number.isFinite(entryY)) {
@@ -637,11 +748,6 @@ export class LevelConfig {
                 y: Math.round(entryY),
                 hasCoord: true
             };
-        }
-
-        const savedCoordinates = this.getSavedCoordinatesForLevel(char, safeLevel);
-        if (savedCoordinates) {
-            return { level: safeLevel, ...savedCoordinates };
         }
 
         const doorEntry = this.findDoorEntryToLevel(dungeonLevel, safeLevel);
@@ -693,41 +799,37 @@ export class LevelConfig {
             return { x: Math.round(doorSpawn.x), y: Math.round(doorSpawn.y), hasCoord: true };
         }
 
-        if (this.isDungeonLevel(targetLevel)) {
-            return { x: 0, y: 0, hasCoord: false };
-        }
-
         if (targetLevel === 'CraftTownTutorial') {
             const spawn = this.getSpawn(targetLevel);
             return { x: Math.round(spawn.x), y: Math.round(spawn.y), hasCoord: true };
         }
 
-        const currentRecord = this.asLevelRecord(char?.CurrentLevel);
-        if (
-            this.normalizeLevelName(currentRecord.name) === targetLevel &&
-            Number.isFinite(currentRecord.x) &&
-            Number.isFinite(currentRecord.y) &&
-            !this.isMissingAuthoredSpawn(targetLevel, Number(currentRecord.x), Number(currentRecord.y))
-        ) {
-            return {
-                x: Math.round(Number(currentRecord.x)),
-                y: Math.round(Number(currentRecord.y)),
-                hasCoord: true
-            };
+        if (this.isDungeonLevel(targetLevel)) {
+            return { x: 0, y: 0, hasCoord: false };
         }
 
-        const previousRecord = this.asLevelRecord(char?.PreviousLevel);
-        if (
-            this.normalizeLevelName(previousRecord.name) === targetLevel &&
-            Number.isFinite(previousRecord.x) &&
-            Number.isFinite(previousRecord.y) &&
-            !this.isMissingAuthoredSpawn(targetLevel, Number(previousRecord.x), Number(previousRecord.y))
-        ) {
-            return {
-                x: Math.round(Number(previousRecord.x)),
-                y: Math.round(Number(previousRecord.y)),
-                hasCoord: true
-            };
+        /**
+         * The player's own last position, and the only kind of it that may be replayed here:
+         * one the client reported standing on. See getConfirmedSpawnForLevel.
+         *
+         * CurrentLevel and PreviousLevel used to be read at this point. They are dead-reckoned
+         * -- `entity.x/y`, a sum of movement deltas on a base the client silently corrects
+         * whenever it snaps a spawn onto floor or lets one fall -- so replaying them is what
+         * put players in the air on entry, and the error compounded on every visit. They are
+         * still written and still used for *which level* a player belongs in; they are simply
+         * no longer trusted as a place to stand.
+         */
+        const confirmed = this.getConfirmedSpawnForLevel(char, targetLevel);
+        if (confirmed) {
+            return { x: confirmed.x, y: confirmed.y, hasCoord: true };
+        }
+
+        if (!this.hasDefaultSpawn(targetLevel)) {
+            // No authored spawn for this level (SwampRoadConnection, anything missing from
+            // level_config.json). getSpawn would hand back 0,0 and claiming that as a real
+            // coordinate spawns the player at the world origin; let the client place them
+            // on the level's own spawn marker instead.
+            return { x: 0, y: 0, hasCoord: false };
         }
 
         const spawn = this.getSpawn(targetLevel);
@@ -739,13 +841,15 @@ export class LevelConfig {
         _oldLevelName: string | null | undefined,
         newLevelName: string | null | undefined,
         newX: number,
-        newY: number
+        newY: number,
+        sourcePosition?: { x?: number; y?: number; hasCoord?: boolean }
     ): void {
         const newLevel = this.normalizeLevelName(newLevelName);
         if (!newLevel || !this.isSaveAllowedLevel(newLevel)) {
             return;
         }
 
+        const oldLevel = this.normalizeLevelName(_oldLevelName);
         const currentRecord = this.asLevelRecord(char?.CurrentLevel);
         const previousRecord = this.asLevelRecord(char?.PreviousLevel);
         const currentName = this.normalizeLevelName(currentRecord.name);
@@ -753,7 +857,25 @@ export class LevelConfig {
 
         if (newLevel === 'CraftTown') {
             let safeFrom: { name: string; x: number; y: number } | null = null;
-            if (currentName && this.isSaveAllowedLevel(currentName) && currentName !== 'CraftTown') {
+            const sourceX = Number(sourcePosition?.x);
+            const sourceY = Number(sourcePosition?.y);
+            if (
+                oldLevel &&
+                oldLevel !== 'CraftTown' &&
+                this.isSaveAllowedLevel(oldLevel) &&
+                sourcePosition?.hasCoord &&
+                Number.isFinite(sourceX) &&
+                Number.isFinite(sourceY)
+            ) {
+                safeFrom = { name: oldLevel, x: Math.round(sourceX), y: Math.round(sourceY) };
+            } else if (oldLevel && oldLevel !== 'CraftTown' && this.isSaveAllowedLevel(oldLevel) && currentName === oldLevel) {
+                safeFrom = this.copyLevelRecord(currentRecord);
+            } else if (oldLevel && oldLevel !== 'CraftTown' && this.isSaveAllowedLevel(oldLevel) && previousName === oldLevel) {
+                safeFrom = this.copyLevelRecord(previousRecord);
+            } else if (oldLevel && oldLevel !== 'CraftTown' && this.isSaveAllowedLevel(oldLevel) && this.hasDefaultSpawn(oldLevel)) {
+                const spawn = this.getSpawn(oldLevel);
+                safeFrom = { name: oldLevel, x: Math.round(spawn.x), y: Math.round(spawn.y) };
+            } else if (currentName && this.isSaveAllowedLevel(currentName) && currentName !== 'CraftTown') {
                 safeFrom = this.copyLevelRecord(currentRecord);
             } else if (previousName && this.isSaveAllowedLevel(previousName) && previousName !== 'CraftTown') {
                 safeFrom = this.copyLevelRecord(previousRecord);
@@ -764,6 +886,7 @@ export class LevelConfig {
             }
 
             char.CurrentLevel = { name: 'CraftTown', x: Math.round(newX), y: Math.round(newY) };
+            this.rememberArrivalAsConfirmedSpawn(char, 'CraftTown', newX, newY);
             return;
         }
 
@@ -772,5 +895,32 @@ export class LevelConfig {
         }
 
         char.CurrentLevel = { name: newLevel, x: Math.round(newX), y: Math.round(newY) };
+        this.rememberArrivalAsConfirmedSpawn(char, newLevel, newX, newY);
+    }
+
+    /**
+     * An arrival coordinate counts as a confirmed floor point.
+     *
+     * Everything that reaches updateSavedLevelsOnTransfer is a coordinate the *level designers*
+     * chose -- a door spawn, a DEFAULT_SPAWNS entry, or a point already confirmed by a client --
+     * because those are the only things getSpawnCoordinates can return. Authored geometry is
+     * floor by construction, which is the same reason the spawn path is happy to fall back to
+     * it, so it is safe to remember and it is what covers the two regions that have no
+     * DEFAULT_SPAWNS entry of their own (SwampRoadConnection): walking in records the door's
+     * own spawn before that region's dungeon door is ever reachable.
+     *
+     * This deliberately does not overwrite a point the player's own client confirmed later --
+     * they walked somewhere after arriving, and that is the better answer.
+     */
+    private static rememberArrivalAsConfirmedSpawn(
+        char: any,
+        levelName: string,
+        x: number,
+        y: number
+    ): void {
+        if (this.getConfirmedSpawnForLevel(char, levelName)) {
+            return;
+        }
+        this.rememberConfirmedSpawn(char, levelName, x, y);
     }
 }

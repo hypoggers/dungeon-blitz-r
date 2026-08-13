@@ -7,7 +7,7 @@
   <File  Version="cbp" Stage="Init"  Size="559"	 Name="Animation_Mage.swf" />
   <File  Version="cbp" Stage="Init"  Size="642"	 Name="Animation_Rogue.swf" />
   
-  <File  Version="cbp" Stage="Login" Size="312"	 Name="Login.swz" />
+  <File  Version="cbq" Stage="Login" Size="334"	 Name="Login.swz" />
   <File  Version="cbp" Stage="Login" Size="2189" Name="Gfx_Paladin_1.swf" />
   <File  Version="cbp" Stage="Login" Size="669"	 Name="Gfx_Rogue_1.swf" />
   <File  Version="cbp" Stage="Login" Size="1747" Name="Gfx_Mage_1.swf" />
@@ -26,7 +26,7 @@
   <File  Version="cbo" Stage="Core"  Size="411"  Name="UI_Seasonal.swf" />
   <File  Version="cbp" Stage="Core"  Size="5072" Name="sounds/Sound.swf" />
   
-  <File  Version="cbq" Stage="Game"  Size="233"	 Name="Game.swz" />
+  <File  Version="cdr" Stage="Game"  Size="233"	 Name="Game.swz" />
   <File  Version="cbp" Stage="Game"  Size="885"	 Name="GlobalMap01.swf" />
   <File  Version="caa" Stage="Game"  Size="133"	 Name="GlobalMap02.swf" />
   <File  Version="caf" Stage="Game"  Size="360"	 Name="Animation_Abomination.swf" />
@@ -47,7 +47,7 @@
   <File  Version="caa" Stage="Game"  Size="27"	 Name="Animation_Larva.swf" />
   <File  Version="caa" Stage="Game"  Size="30"	 Name="Animation_Mimic.swf" />
   <File  Version="caa" Stage="Game"  Size="429"	 Name="Animation_Nephit.swf" />
-  <File  Version="caf" Stage="Game"  Size="812"	 Name="Animation_NPC.swf" />
+  <File  Version="cag" Stage="Game"  Size="823"	 Name="Animation_NPC.swf" />
   <File  Version="cbp" Stage="Game"  Size="285"	 Name="Animation_Pets.swf" />
   <File  Version="caa" Stage="Game"  Size="57"	 Name="Animation_Psychophage.swf" />
   <File  Version="caa" Stage="Game"  Size="89"	 Name="Animation_Puck.swf" />
@@ -68,6 +68,15 @@
   <Level Version="cbp"				 Size="2658" Name="LevelsHome.swf" />
   <Level Version="cbp"				 Size="3728" Name="LevelsJC.swf" />
   <Level Version="cam"				 Size="1337" Name="LevelsLD.swf" />
+  <Level Version="cbp"				 Size="320" Name="LevelsLI01.swf" />
+  <Level Version="cbp"				 Size="464" Name="LevelsLI02.swf" />
+  <Level Version="cbp"				 Size="638" Name="LevelsLI03.swf" />
+  <Level Version="cbp"				 Size="572" Name="LevelsLI04.swf" />
+  <Level Version="cbp"				 Size="532" Name="LevelsLI05.swf" />
+  <Level Version="cbp"				 Size="718" Name="LevelsLI06.swf" />
+  <Level Version="cbp"				 Size="913" Name="LevelsLI07.swf" />
+  <Level Version="cbp"				 Size="363" Name="LevelsLI08.swf" />
+  <Level Version="cbp"				 Size="200" Name="LevelsLI09.swf" />
   <Level Version="cbp"				 Size="2647" Name="LevelsNR.swf" />
   <Level Version="cbp"				 Size="1967" Name="LevelsOMM.swf" />
   <Level Version="cam"				 Size="1792" Name="LevelsSD.swf" />

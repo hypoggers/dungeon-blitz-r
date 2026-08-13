@@ -46,7 +46,7 @@ export class EquipmentHandler {
             changedSlots.add(slot);
         }
 
-        await EquipmentHandler.persistAndBroadcast(client, entityId, changedSlots);
+        EquipmentHandler.persistAndBroadcast(client, entityId, changedSlots);
     }
 
     static async handleUpdateSingleGear(client: Client, data: Buffer): Promise<void> {
@@ -64,7 +64,7 @@ export class EquipmentHandler {
         const gearId = br.readMethod20(11);
         EquipmentHandler.applyGearToSlot(client, slot, gearId);
 
-        await EquipmentHandler.persistAndBroadcast(client, entityId, new Set([slot]));
+        EquipmentHandler.persistAndBroadcast(client, entityId, new Set([slot]));
     }
 
     static async handleSocketCharm(client: Client, data: Buffer): Promise<void> {
@@ -122,7 +122,7 @@ export class EquipmentHandler {
         EquipmentHandler.updateLiveEntity(client);
 
         const changedSlot = gearIndex + 1;
-        await EquipmentHandler.persistAndBroadcast(client, entityId, new Set([changedSlot]));
+        EquipmentHandler.persistAndBroadcast(client, entityId, new Set([changedSlot]));
         EquipmentHandler.sendGearToSelf(client);
     }
 
@@ -317,15 +317,13 @@ export class EquipmentHandler {
         }
 
         const equippedGears = EquipmentHandler.ensureEquippedGears(client);
-        const nextGear = gearId > 0
-            ? EquipmentHandler.normalizeGearEntry(
-                EquipmentHandler.resolveOwnedGear(client, gearId) ?? {
-                    gearID: gearId,
-                    tier: 0,
-                    runes: [0, 0, 0],
-                    colors: [0, 0]
-                }
-            )
+        const ownedGear = gearId > 0 ? EquipmentHandler.resolveOwnedGear(client, gearId) : null;
+        if (gearId > 0 && !ownedGear) {
+            console.warn(`[EquipmentAuthority] rejected unowned gear userId=${client.userId ?? 0} gearId=${gearId} slot=${slot}`);
+            return;
+        }
+        const nextGear = ownedGear
+            ? EquipmentHandler.normalizeGearEntry(ownedGear)
             : EquipmentHandler.emptyGearEntry();
 
         equippedGears[index] = nextGear;
@@ -458,21 +456,33 @@ export class EquipmentHandler {
         );
     }
 
-    private static async persistAndBroadcast(client: Client, entityId: number, changedSlots: Set<number>): Promise<void> {
+    private static persistAndBroadcast(client: Client, entityId: number, changedSlots: Set<number>): void {
         if (!client.character || changedSlots.size === 0) {
             return;
         }
 
         EquipmentHandler.upsertCharacterSnapshot(client);
-        if (client.userId) {
-            await db.saveCharacters(client.userId, client.characters);
-        }
-
         EquipmentHandler.broadcastEquipmentUpdate(client, entityId, changedSlots);
+        // broadcastEquipmentUpdate deliberately skips the player who equipped, so without
+        // this they never hear their own new set back. The armory only applies the change
+        // to its preview doll, so the real entity's equippedGear stayed at whatever the
+        // login packet set - which is why the dye screen kept showing the previous set.
+        EquipmentHandler.sendGearToSelf(client);
         EntityHandler.refreshPlayerSnapshot(client);
         client.combatStatsDirty = true;
         client.allowDirtyCombatStatsRegen = true;
         client.lastCombatStatsRefreshRequestAt = Date.now();
         CharacterSync.requestCombatStatsRefresh(client);
+
+        if (!client.userId) {
+            return;
+        }
+        if (typeof client.scheduleCharacterSave === 'function') {
+            client.scheduleCharacterSave('equipment update');
+            return;
+        }
+        void db.saveCharacters(client.userId, client.characters).catch((error) => {
+            console.error('[EquipmentHandler] Deferred equipment save failed:', error);
+        });
     }
 }

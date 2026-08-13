@@ -8,6 +8,7 @@ import { GlobalState } from '../core/GlobalState';
 import { EntityHandler } from './EntityHandler';
 import { areClientsInSameLevelScope, getClientLevelScope } from '../core/LevelScope';
 import { ConsumableID } from '../data/runtime/Consumables';
+import { SpeedupPricing } from '../core/SpeedupPricing';
 
 const db = new JsonAdapter();
 
@@ -20,6 +21,7 @@ export class PetHandler {
     private static readonly HATCHERY_RANK1_WEIGHT = 0.175;
     private static readonly HATCHERY_RANK2_WEIGHT = 0.075;
     private static readonly HATCHED_EGG_PET_FOOD_AMOUNT = 1;
+    private static readonly eggReadyTimers = new WeakMap<Client, NodeJS.Timeout>();
 
     private static sendMammothIdolUpdate(client: Client): void {
         if (!client.character) {
@@ -68,6 +70,30 @@ export class PetHandler {
         const bb = new BitBuffer(false);
         bb.writeMethod4(xpAmount);
         client.sendBitBuffer(0xF2, bb);
+    }
+
+    private static sendPetTrainingComplete(client: Client, petTypeId: number): void {
+        const bb = new BitBuffer(false);
+        bb.writeMethod6(Math.max(0, petTypeId), 7);
+        bb.writeMethod4(Math.floor(Date.now() / 1000));
+        client.sendBitBuffer(0xEE, bb);
+    }
+
+    private static syncPetLevelReferences(character: any, typeId: number, specialId: number, level: number): void {
+        const equipped = [
+            character?.activePet,
+            ...(Array.isArray(character?.restingPets) ? character.restingPets : [])
+        ];
+
+        for (const pet of equipped) {
+            const equippedSpecialId = Number(pet?.special_id ?? 0);
+            if (
+                Number(pet?.typeID ?? pet?.petID ?? 0) === typeId &&
+                (equippedSpecialId <= 0 || equippedSpecialId === specialId)
+            ) {
+                pet.level = level;
+            }
+        }
     }
 
     static getActivePetRecord(character: any): any | null {
@@ -340,6 +366,69 @@ export class PetHandler {
         return normalized;
     }
 
+    private static normalizeEquippedPetSlot(slot: any): { typeID: number; special_id: number } {
+        return {
+            typeID: Math.max(0, Math.round(Number(slot?.typeID ?? slot?.petID ?? 0) || 0)),
+            special_id: Math.max(0, Math.round(Number(slot?.special_id ?? slot?.uniqueID ?? 0) || 0))
+        };
+    }
+
+    private static sameEquippedPetSlot(left: any, right: any): boolean {
+        const normalizedLeft = PetHandler.normalizeEquippedPetSlot(left);
+        const normalizedRight = PetHandler.normalizeEquippedPetSlot(right);
+        return normalizedLeft.typeID === normalizedRight.typeID &&
+            normalizedLeft.special_id === normalizedRight.special_id;
+    }
+
+    static syncEquippedCompanionState(target: any, source: any): boolean {
+        if (!target || !source) {
+            return false;
+        }
+
+        let changed = false;
+
+        if (source.equippedMount !== undefined) {
+            const sourceMount = Math.max(0, Math.round(Number(source.equippedMount ?? 0) || 0));
+            const targetMount = Math.max(0, Math.round(Number(target.equippedMount ?? 0) || 0));
+            if (sourceMount !== targetMount) {
+                target.equippedMount = sourceMount;
+                changed = true;
+            }
+        }
+
+        if (source.activePet !== undefined) {
+            const sourceActivePet = PetHandler.normalizeEquippedPetSlot(source.activePet);
+            if (!PetHandler.sameEquippedPetSlot(target.activePet, sourceActivePet)) {
+                target.activePet = sourceActivePet.typeID > 0 ? sourceActivePet : {};
+                changed = true;
+            }
+        }
+
+        const sourceRestingPets = Array.isArray(source.restingPets)
+            ? source.restingPets
+                .map((pet: any) => PetHandler.normalizeEquippedPetSlot(pet))
+                .filter((pet: { typeID: number; special_id: number }) => pet.typeID > 0)
+                .slice(0, PetHandler.MAX_PASSIVE_PET_SLOTS)
+            : [];
+        const targetRestingPets = Array.isArray(target.restingPets)
+            ? target.restingPets.map((pet: any) => PetHandler.normalizeEquippedPetSlot(pet))
+            : [];
+        if (Array.isArray(source.restingPets) && (
+            sourceRestingPets.length !== targetRestingPets.length ||
+            sourceRestingPets.some((pet: { typeID: number; special_id: number }, index: number) =>
+                !PetHandler.sameEquippedPetSlot(targetRestingPets[index], pet)
+            )
+        )) {
+            target.restingPets = sourceRestingPets;
+            changed = true;
+        }
+
+        PetHandler.normalizeMountState(target);
+        PetHandler.normalizePetCollection(target);
+
+        return changed;
+    }
+
     static armMountTravelProtection(client: Client, durationMs: number = 4000, reassert: boolean = false): void {
         const mountId = Number(client.character?.equippedMount ?? 0);
         if (mountId <= 0) {
@@ -546,26 +635,10 @@ export class PetHandler {
 
     static async handleRequestHatcheryEggs(client: Client, data: Buffer): Promise<void> {
         if (!client.character) return;
+        await PetHandler.syncCompletedEggHatch(client);
         
-        const now = Math.floor(Date.now() / 1000);
-        let owned = PetHandler.normalizeOwnedEggIds(client.character);
-        let resetTime = client.character.EggResetTime || 0;
-
-        if (now >= resetTime) {
-            const maxSlots = PetConfig.MAX_EGG_SLOTS;
-            const openSlots = maxSlots - owned.length;
-            
-            if (openSlots > 0) {
-                const newCount = Math.min(openSlots, 3);
-                const addedEggs = PetHandler.pickDailyEggs(newCount);
-                owned = owned.concat(addedEggs);
-                console.log(`[PetHandler] Added eggs: ${addedEggs}`);
-            }
-
-            resetTime = now + PetConfig.NEW_EGG_SET_TIME;
-            client.character.EggResetTime = resetTime;
-            client.character.OwnedEggsID = owned;
-            
+        const hatchery = PetHandler.ensureAvailableHatcheryEggs(client.character);
+        if (hatchery.changed) {
             if (client.userId) {
                 await PetHandler.saveCharacter(client);
             }
@@ -573,7 +646,7 @@ export class PetHandler {
 
         client.character.EggNotifySent = false;
         
-        const pkt = PetHandler.buildHatcheryPacket(owned, resetTime);
+        const pkt = PetHandler.buildHatcheryPacket(hatchery.owned, hatchery.resetTime);
         client.sendBitBuffer(0xE5, pkt);
     }
     
@@ -626,6 +699,41 @@ export class PetHandler {
         return 0;
     }
 
+    static ensureAvailableHatcheryEggs(
+        character: any,
+        now: number = Math.floor(Date.now() / 1000)
+    ): { owned: number[]; resetTime: number; changed: boolean } {
+        const previousOwnedLength = Array.isArray(character?.OwnedEggsID) ? character.OwnedEggsID.length : 0;
+        let owned = PetHandler.normalizeOwnedEggIds(character);
+        let resetTime = Number(character?.EggResetTime ?? 0);
+        if (!Number.isFinite(resetTime) || resetTime < 0) {
+            resetTime = 0;
+        }
+        let changed = previousOwnedLength !== owned.length;
+
+        if (now >= resetTime || owned.length === 0) {
+            const maxSlots = PetConfig.MAX_EGG_SLOTS;
+            const openSlots = maxSlots - owned.length;
+
+            if (openSlots > 0) {
+                const newCount = Math.min(openSlots, 3);
+                const addedEggs = PetHandler.pickDailyEggs(newCount);
+                owned = owned.concat(addedEggs);
+                console.log(`[PetHandler] Added eggs: ${addedEggs}`);
+            }
+
+            resetTime = now + PetConfig.NEW_EGG_SET_TIME;
+            changed = true;
+        }
+
+        if (character) {
+            character.OwnedEggsID = owned;
+            character.EggResetTime = resetTime;
+        }
+
+        return { owned, resetTime, changed };
+    }
+
     private static buildHatcheryPacket(eggs: number[], resetTime: number): BitBuffer {
         const bb = new BitBuffer();
         const maxSlots = PetConfig.MAX_EGG_SLOTS;
@@ -643,11 +751,16 @@ export class PetHandler {
         return bb;
     }
 
-    private static normalizeOwnedEggIds(character: any): number[] {
+    static normalizeOwnedEggIds(character: any): number[] {
         const eggs = Array.isArray(character?.OwnedEggsID) ? character.OwnedEggsID : [];
         const normalized = eggs
             .map((eggId: unknown) => Number(eggId ?? 0))
-            .filter((eggId: number) => Number.isFinite(eggId) && eggId >= 0);
+            .filter((eggId: number) => (
+                Number.isInteger(eggId) &&
+                eggId > 0 &&
+                eggId < 64 &&
+                (PetConfig.EGG_TYPES.length === 0 || Boolean(PetConfig.getEggDef(eggId)))
+            ));
 
         if (character) {
             character.OwnedEggsID = normalized;
@@ -685,6 +798,58 @@ export class PetHandler {
         character.activeEggCount = 0;
     }
 
+    private static sendEggReadyPacket(client: Client, eggId: number): void {
+        const bb = new BitBuffer();
+        bb.writeMethod6(Math.max(0, eggId), 6);
+        client.sendBitBuffer(0xE7, bb);
+    }
+
+    private static clearEggReadyTimer(client: Client): void {
+        const timer = PetHandler.eggReadyTimers.get(client);
+        if (timer) {
+            clearTimeout(timer);
+            PetHandler.eggReadyTimers.delete(client);
+        }
+    }
+
+    private static scheduleEggReadyTimer(client: Client, readyTime: number): void {
+        PetHandler.clearEggReadyTimer(client);
+
+        const now = Math.floor(Date.now() / 1000);
+        const delayMs = Math.max(0, readyTime - now) * 1000;
+        const timer = setTimeout(() => {
+            PetHandler.eggReadyTimers.delete(client);
+            void PetHandler.syncCompletedEggHatch(client);
+        }, delayMs);
+        timer.unref?.();
+        PetHandler.eggReadyTimers.set(client, timer);
+    }
+
+    static async syncCompletedEggHatch(
+        client: Client,
+        now: number = Math.floor(Date.now() / 1000)
+    ): Promise<boolean> {
+        if (!client.character) {
+            return false;
+        }
+
+        const eggData = PetHandler.getNormalizedEggHatchery(client.character);
+        if (!eggData || eggData.EggID <= 0 || eggData.ReadyTime <= 0 || eggData.ReadyTime > now) {
+            return false;
+        }
+
+        eggData.ReadyTime = 0;
+        client.character.EggHachery = eggData;
+        PetHandler.clearEggReadyTimer(client);
+
+        if (client.userId) {
+            await PetHandler.saveCharacter(client);
+        }
+
+        PetHandler.sendEggReadyPacket(client, eggData.EggID);
+        return true;
+    }
+
     static async handleTrainPet(client: Client, data: Buffer): Promise<void> {
         const br = new BitReader(data);
         const typeID = br.readMethod6(7);
@@ -693,8 +858,19 @@ export class PetHandler {
         const useIdols = br.readMethod15();
 
         if (!client.character) return;
+
+        const pets = PetHandler.normalizePetCollection(client.character);
+        const pet = pets.find((entry: any) =>
+            Number(entry?.typeID ?? 0) === typeID &&
+            Number(entry?.special_id ?? 0) === uniqueID
+        );
+        if (!pet) return;
+
+        const currentRank = Math.max(1, Number(pet.level ?? 1));
+        if (nextRank !== currentRank + 1 || nextRank >= PetConfig.TRAINING_GOLD_COST.length) {
+            return;
+        }
         
-        const trainTime = PetConfig.TRAINING_TIME[nextRank] || 0;
         const goldCost = PetConfig.TRAINING_GOLD_COST[nextRank] || 0;
         const idolCost = PetConfig.TRAINING_IDOL_COST[nextRank] || 0;
 
@@ -708,15 +884,12 @@ export class PetHandler {
             PetHandler.sendGoldLoss(client, goldCost);
         }
 
-        const readyAt = Math.floor(Date.now() / 1000) + trainTime;
-        
-        client.character.trainingPet = [{
-            typeID: typeID,
-            special_id: uniqueID,
-            trainingTime: readyAt
-        }];
+        pet.level = nextRank;
+        PetHandler.syncPetLevelReferences(client.character, typeID, uniqueID, nextRank);
+        client.character.trainingPet = [];
 
         await PetHandler.saveCharacter(client);
+        PetHandler.sendPetTrainingComplete(client, typeID);
     }
 
     static async handlePetTrainingCollect(client: Client, data: Buffer): Promise<void> {
@@ -746,11 +919,7 @@ export class PetHandler {
         // Update active pet if it's the one trained
         // Note: activePet stores only type/id usually, but updating level here ensures sync if stored.
         
-        client.character.trainingPet = [{
-            typeID: 0,
-            special_id: 0,
-            trainingTime: 0
-        }];
+        client.character.trainingPet = [];
 
         await PetHandler.saveCharacter(client);
         
@@ -760,36 +929,46 @@ export class PetHandler {
 
     static async handlePetTrainingCancel(client: Client, data: Buffer): Promise<void> {
         if (!client.character) return;
-        client.character.trainingPet = [{
-            typeID: 0,
-            special_id: 0,
-            trainingTime: 0
-        }];
+        client.character.trainingPet = [];
         await PetHandler.saveCharacter(client);
     }
     
     static async handlePetSpeedUp(client: Client, data: Buffer): Promise<void> {
         const br = new BitReader(data);
         const idolCost = br.readMethod9();
-        
+
         if (!client.character) return;
-        if ((client.character.mammothIdols || 0) < idolCost) return;
-        
-        client.character.mammothIdols = (client.character.mammothIdols || 0) - idolCost;
-        PetHandler.sendMammothIdolUpdate(client);
-        
+
+        // Nothing training used to still take the idols, because they were spent before
+        // this was checked.
         const tpList = client.character.trainingPet || [];
-        if (tpList.length > 0) {
-            tpList[0].trainingTime = 0;
-            const petType = tpList[0].typeID;
-            
-            await PetHandler.saveCharacter(client);
-            
-            const bb = new BitBuffer();
-            bb.writeMethod6(petType, 7);
-            bb.writeMethod4(Math.floor(Date.now()/1000));
-            client.sendBitBuffer(0xEE, bb);
+        if (tpList.length === 0) {
+            SpeedupPricing.refreshScreens(client);
+            return;
         }
+
+        const authoritativeCost = SpeedupPricing.reconcile(tpList[0].trainingTime, idolCost);
+        const idols = Number(client.character.mammothIdols || 0);
+        if (idols < authoritativeCost) {
+            console.warn(
+                `[Pet] Refused a training Speed Up for ${client.character.name}: ` +
+                `has ${idols} idols, needs ${authoritativeCost} (client claimed ${idolCost}).`
+            );
+            SpeedupPricing.refreshScreens(client);
+            return;
+        }
+
+        if (authoritativeCost > 0) {
+            client.character.mammothIdols = idols - authoritativeCost;
+            PetHandler.sendMammothIdolUpdate(client);
+        }
+
+        tpList[0].trainingTime = 0;
+        const petType = tpList[0].typeID;
+
+        await PetHandler.saveCharacter(client);
+
+        PetHandler.sendPetTrainingComplete(client, petType);
     }
 
     static async handleEggHatch(client: Client, data: Buffer): Promise<void> {
@@ -799,21 +978,29 @@ export class PetHandler {
 
         if (!client.character) return;
         const owned = PetHandler.normalizeOwnedEggIds(client.character);
-        if (slotIndex < 0 || slotIndex >= owned.length) return;
+        if (slotIndex < 0 || slotIndex >= owned.length) {
+            return;
+        }
 
         const eggID = Number(owned[slotIndex] ?? 0);
         const eggDef = PetConfig.getEggDef(eggID);
-        if (!eggDef) return;
+        if (!eggDef) {
+            return;
+        }
 
         const goldCost = PetConfig.EGG_GOLD_COST[slotIndex] || 0;
         const idolCost = PetConfig.EGG_IDOL_COST[slotIndex] || 0;
 
         if (useIdols) {
-            if ((client.character.mammothIdols || 0) < idolCost) return;
+            if ((client.character.mammothIdols || 0) < idolCost) {
+                return;
+            }
             client.character.mammothIdols = (client.character.mammothIdols || 0) - idolCost;
             PetHandler.sendMammothIdolUpdate(client);
         } else {
-            if ((client.character.gold || 0) < goldCost) return;
+            if ((client.character.gold || 0) < goldCost) {
+                return;
+            }
             client.character.gold = (client.character.gold || 0) - goldCost;
             PetHandler.sendGoldLoss(client, goldCost);
         }
@@ -825,7 +1012,7 @@ export class PetHandler {
         if (!hasPets) {
             duration = 180;
         } else {
-            duration = PetConfig.EGG_HATCH_TIMES[eggRank as 0|1|2] || 864000;
+            duration = PetConfig.getEggHatchTime(eggRank);
         }
 
         const now = Math.floor(Date.now() / 1000);
@@ -839,28 +1026,44 @@ export class PetHandler {
         client.character.activeEggCount = 1;
         
         await PetHandler.saveCharacter(client);
+        PetHandler.scheduleEggReadyTimer(client, readyTime);
     }
     
     static async handleEggSpeedUp(client: Client, data: Buffer): Promise<void> {
         const br = new BitReader(data);
         const idolCost = br.readMethod9();
-        
+
         if (!client.character) return;
-        if ((client.character.mammothIdols || 0) < idolCost) return;
-        
-        client.character.mammothIdols = (client.character.mammothIdols || 0) - idolCost;
-        PetHandler.sendMammothIdolUpdate(client);
-        
+
+        // Same order-of-operations bug as pet training: an empty hatchery took the idols.
         const eggData = PetHandler.getNormalizedEggHatchery(client.character);
-        if (eggData && eggData.EggID > 0) {
-            eggData.ReadyTime = 0;
-            client.character.EggHachery = eggData;
-            await PetHandler.saveCharacter(client);
-            
-            const bb = new BitBuffer();
-            bb.writeMethod6(eggData.EggID, 6);
-            client.sendBitBuffer(0xE7, bb);
+        if (!eggData || eggData.EggID <= 0) {
+            SpeedupPricing.refreshScreens(client);
+            return;
         }
+
+        const authoritativeCost = SpeedupPricing.reconcile(eggData.ReadyTime, idolCost);
+        const idols = Number(client.character.mammothIdols || 0);
+        if (idols < authoritativeCost) {
+            console.warn(
+                `[Pet] Refused an egg Speed Up for ${client.character.name}: ` +
+                `has ${idols} idols, needs ${authoritativeCost} (client claimed ${idolCost}).`
+            );
+            SpeedupPricing.refreshScreens(client);
+            return;
+        }
+
+        if (authoritativeCost > 0) {
+            client.character.mammothIdols = idols - authoritativeCost;
+            PetHandler.sendMammothIdolUpdate(client);
+        }
+
+        PetHandler.clearEggReadyTimer(client);
+        eggData.ReadyTime = 0;
+        client.character.EggHachery = eggData;
+        await PetHandler.saveCharacter(client);
+
+        PetHandler.sendEggReadyPacket(client, eggData.EggID);
     }
 
     static async handleCollectHatchedEgg(client: Client, data: Buffer): Promise<void> {
@@ -892,6 +1095,7 @@ export class PetHandler {
                 PetHandler.HATCHED_EGG_PET_FOOD_AMOUNT
             );
             PetHandler.removeHatchedEggFromSlot(client.character, slotIndex);
+            PetHandler.clearEggReadyTimer(client);
 
             await PetHandler.saveCharacter(client);
 
@@ -922,6 +1126,7 @@ export class PetHandler {
         client.character.pets = pets;
         
         PetHandler.removeHatchedEggFromSlot(client.character, slotIndex);
+        PetHandler.clearEggReadyTimer(client);
         
         await PetHandler.saveCharacter(client);
         
@@ -940,6 +1145,7 @@ export class PetHandler {
 
     static async handleCancelEggHatch(client: Client, data: Buffer): Promise<void> {
         if (!client.character) return;
+        PetHandler.clearEggReadyTimer(client);
         PetHandler.resetEggHatchery(client.character);
         await PetHandler.saveCharacter(client);
     }

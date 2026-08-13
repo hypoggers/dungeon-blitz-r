@@ -142,7 +142,7 @@
         ]
       },
       "felguard": {
-        "displayName": "Felguard",
+        "displayName": "Benjaea",
         "defaultLines": [
           "The woods are full of bandits.",
           "But they'd never come here."
@@ -214,6 +214,7 @@
       },
       "npctraveller": {
         "displayName": "Bella Sagesword",
+        "scriptedText": "Have a care! Did I restore the Dreadfold Gate so you could stumble to your doom?=@I'm guessing no?=Long ago, the wizard Caphrax sundered the world into two time-rivers=The two branches are close but separated=Into one branch the wizard channeled the dread magic of the Sleeping Lands, creating The Dreadfold=@Ooooh=Yes, a dark, magic-drenched mirror of our world lies through this gate=@Can I have a look?=Are you mad? Only a battle-hardened team of adventurers stands any chance through that gate=@So, no?=I'd suggest you master the perils of this world first",
         "defaultLines": [
           "Have a care! Did I restore the Dreadfold Gate so you could stumble to your doom?",
           "Long ago, the wizard Caphrax sundered the world into two time-rivers",
@@ -393,7 +394,7 @@
         ]
       },
       "felguardhard": {
-        "displayName": "Felguard",
+        "displayName": "Benjaea",
         "defaultLines": [
           "The woods are full of bandits.",
           "But they'd never come here."
@@ -1354,7 +1355,7 @@
         ]
       },
       "nrmayor01": {
-        "displayName": "Mayor Ristas",
+        "displayName": "Mayor Justin",
         "defaultLines": [
           "Our village might be small, but we are strong.",
           "The goblins have been more aggressive lately.",
@@ -3302,6 +3303,32 @@
           "You can find the village on the map.",
           "Just head east and you'll find it.",
           "I'll try to repair the Niobe."
+        ]
+      }
+    },
+    "CraftTown": {
+      "npchomemailbox": {
+        "displayName": "Mailbox",
+        "defaultLines": [
+          "The mailbox is empty.",
+          "No letters today.",
+          "A spider has claimed the inside of the mailbox."
+        ]
+      },
+      "npchomexpbonus": {
+        "displayName": "Tome of Experience",
+        "defaultLines": [
+          "The tome hums. Its lessons stay with you a little longer now.",
+          "Pages of every battle you have fought.",
+          "Studying it makes the next fight come easier."
+        ]
+      },
+      "npchomefindingbonus": {
+        "displayName": "Tome of Finding",
+        "defaultLines": [
+          "The tome smells of old coin.",
+          "It maps out where the good loot hides.",
+          "Keep it close and treasure keeps turning up."
         ]
       }
     }

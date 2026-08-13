@@ -142,7 +142,7 @@
         ]
       },
       "felguard": {
-        "displayName": "Felguard",
+        "displayName": "Benjaea",
         "defaultLines": [
           "Orman haydutlarla dolu.",
           "Ama buraya asla gelmezlerdi."
@@ -393,7 +393,7 @@
         ]
       },
       "felguardhard": {
-        "displayName": "Felguard",
+        "displayName": "Benjaea",
         "defaultLines": [
           "Orman haydutlarla dolu.",
           "Ama buraya asla gelmezlerdi."
@@ -1307,7 +1307,7 @@
         "displayName": "Tyna"
       },
       "nrmayor01": {
-        "displayName": "Belediye Baskani Ristas",
+        "displayName": "Belediye Baskani Justin",
         "defaultLines": [
           "Koyumuz kucuk olabilir ama gucluyuz.",
           "Goblinler son zamanlarda daha saldirgan oldu.",
@@ -3156,6 +3156,32 @@
           "Koyu haritada bulabilirsiniz.",
           "Sadece doguya git ve onu bulacaksin.",
           "Niobe'yi tamir etmeye calisacagim."
+        ]
+      }
+    },
+    "CraftTown": {
+      "npchomemailbox": {
+        "displayName": "Posta Kutusu",
+        "defaultLines": [
+          "Posta kutusu bos.",
+          "Bugun mektup yok.",
+          "Posta kutusunun icini bir orumcek sahiplenmis."
+        ]
+      },
+      "npchomexpbonus": {
+        "displayName": "Tecrube Kitabi",
+        "defaultLines": [
+          "Kitap ugulduyor. Ogrendiklerin artik biraz daha kalici.",
+          "Verdigin her savasin sayfalari burada.",
+          "Uzerinde calismak bir sonraki dovusu kolaylastiriyor."
+        ]
+      },
+      "npchomefindingbonus": {
+        "displayName": "Bulus Kitabi",
+        "defaultLines": [
+          "Kitap eski para kokuyor.",
+          "Iyi ganimetin nerede sakli oldugunu gosteriyor.",
+          "Yaninda tut, hazine bulmaya devam edersin."
         ]
       }
     }

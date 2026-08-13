@@ -1,4 +1,5 @@
 import { GlobalState, SharedDungeonProgressState } from './GlobalState';
+import { DungeonSpawnLoader, DungeonSpawnConfig } from '../data/DungeonSpawnLoader';
 import { getActiveDungeonRunStats } from './DungeonRunStats';
 import { LevelConfig } from './LevelConfig';
 import { getClientLevelScope, getScopeLevelName } from './LevelScope';
@@ -31,11 +32,33 @@ function clampProgress(value: unknown): number {
     return Math.max(0, Math.min(100, Math.round(progress)));
 }
 
+function getRequiredForClearProgressConfig(levelName: string | null | undefined): DungeonSpawnConfig | null {
+    return DungeonSpawnLoader.getSpawnConfigForLevel(LevelConfig.normalizeLevelName(levelName));
+}
+
+function usesRequiredForClearProgress(levelScope: string | null | undefined, levelName: string | null | undefined): boolean {
+    if (getRequiredForClearProgressConfig(levelName)) {
+        return true;
+    }
+
+    const levelMap = GlobalState.levelEntities.get(String(levelScope ?? '').trim());
+    for (const entity of levelMap?.values() ?? []) {
+        if (entity?.requiredForClear === true) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 export function usesSharedDungeonProgress(levelName: string | null | undefined): boolean {
     const normalizedLevel = LevelConfig.normalizeLevelName(levelName);
     return Boolean(normalizedLevel) &&
         !SHARED_DUNGEON_PROGRESS_EXCLUDED_LEVELS.has(normalizedLevel) &&
-        isWolfsEndDungeonLevel(normalizedLevel);
+        (
+            isWolfsEndDungeonLevel(normalizedLevel) ||
+            Boolean(getRequiredForClearProgressConfig(normalizedLevel))
+        );
 }
 
 export function getSharedDungeonInitialProgress(levelName: string | null | undefined): number {
@@ -101,8 +124,8 @@ function refreshSharedDungeonLiveStats(
     state.liveStatsByCharacter ??= new Map();
     state.liveStatsByCharacter.clear();
 
-    for (const session of GlobalState.sessionsByToken.values()) {
-        if (!session?.playerSpawned || getClientLevelScope(session) !== levelScope) {
+    for (const session of GlobalState.getSessionsInLevelScope(levelScope)) {
+        if (!session?.playerSpawned) {
             continue;
         }
 
@@ -134,6 +157,10 @@ function refreshSharedDungeonLiveStats(
 }
 
 function isSharedDungeonTrackedHostile(entity: any): boolean {
+    if (entity?.requiredForClear === true && isDungeonStatsHostile(entity)) {
+        return true;
+    }
+
     return Boolean(entity?.clientSpawned) && isDungeonStatsHostile(entity);
 }
 
@@ -148,8 +175,9 @@ export function resolveSharedDungeonProgressAuthorityToken(levelScope: string | 
     }
 
     let scopedPartyLeaderKey = '';
-    for (const session of GlobalState.sessionsByToken.values()) {
-        if (!session?.playerSpawned || getClientLevelScope(session) !== scopeKey) {
+    const scopedSessions = Array.from(GlobalState.getSessionsInLevelScope(scopeKey));
+    for (const session of scopedSessions) {
+        if (!session?.playerSpawned) {
             continue;
         }
 
@@ -161,11 +189,10 @@ export function resolveSharedDungeonProgressAuthorityToken(levelScope: string | 
     }
 
     if (scopedPartyLeaderKey) {
-        for (const session of GlobalState.sessionsByToken.values()) {
+        for (const session of scopedSessions) {
             if (
                 session?.playerSpawned &&
                 session.token > 0 &&
-                getClientLevelScope(session) === scopeKey &&
                 normalizeCharacterKey(session.character?.name) === scopedPartyLeaderKey
             ) {
                 return session.token;
@@ -300,6 +327,14 @@ export function recomputeSharedDungeonProgress(levelScope: string | null | undef
 
     const totals = getSharedDungeonProgressTotals(levelScope);
     const levelName = getScopeLevelName(levelScope);
+    if (usesRequiredForClearProgress(scopeKey, levelName)) {
+        state.progress = totals.total > 0
+            ? clampProgress(Math.floor((totals.defeated / totals.total) * 100))
+            : 0;
+        refreshSharedDungeonLiveStats(state, scopeKey);
+        return state;
+    }
+
     if (usesSharedDungeonProgress(levelName)) {
         const initialProgress = getSharedDungeonInitialProgress(levelName);
         state.progress = totals.total > 0

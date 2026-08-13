@@ -5,6 +5,7 @@ import { JsonAdapter } from '../database/JsonAdapter';
 import { TalentConfig } from '../core/TalentConfig';
 import { EntityHandler } from './EntityHandler';
 import { WorldEnter } from '../utils/WorldEnter';
+import { SpeedupPricing } from '../core/SpeedupPricing';
 
 type TalentResearchRecord = {
     classIndex?: number | null;
@@ -14,6 +15,8 @@ type TalentResearchRecord = {
 const db = new JsonAdapter();
 
 export class TalentHandler {
+    private static readonly MAX_TALENT_POINTS_PER_CLASS = 50;
+
     static syncResearchTimer(client: Client): void {
         TalentHandler.clearResearchTimer(client);
 
@@ -48,7 +51,7 @@ export class TalentHandler {
                 return;
             }
 
-            TalentHandler.sendTalentResearchComplete(client, classIndex);
+            void TalentHandler.completeTalentResearch(client, classIndex, true);
         }, delayMs);
         timer.unref?.();
         client.talentResearchTimer = timer;
@@ -168,9 +171,16 @@ export class TalentHandler {
             client.character.talentPoints = {};
         }
 
+        if (!TalentHandler.isValidTalentClassIndex(classIndex)) {
+            return;
+        }
+
         const currentPoints = Number(client.character.talentPoints[String(classIndex)] ?? 0);
+        if (currentPoints >= TalentHandler.MAX_TALENT_POINTS_PER_CLASS) {
+            return;
+        }
+
         const durationIndex = currentPoints + 1;
-        const duration = Number(TalentConfig.RESEARCH_DURATIONS[durationIndex] ?? 0);
         const goldCost = Number(TalentConfig.RESEARCH_COSTS[durationIndex] ?? 0);
         const idolCost = Number(TalentConfig.IDOL_COST[durationIndex] ?? 0);
         const now = Math.floor(Date.now() / 1000);
@@ -182,11 +192,8 @@ export class TalentHandler {
             }
 
             client.character.mammothIdols = idols - idolCost;
-            client.character.talentResearch = {
-                classIndex,
-                ReadyTime: now
-            };
-            await TalentHandler.saveCharacter(client);
+            TalentHandler.setPendingCompletedResearch(client.character, classIndex, now);
+            await TalentHandler.completeTalentResearch(client, classIndex, false);
             TalentHandler.syncResearchTimer(client);
             TalentHandler.sendPremiumPurchase(client, 'TalentResearch', idolCost);
             TalentHandler.sendTalentResearchComplete(client, classIndex);
@@ -199,13 +206,11 @@ export class TalentHandler {
         }
 
         client.character.gold = gold - goldCost;
-        client.character.talentResearch = {
-            classIndex,
-            ReadyTime: now + duration
-        };
+        TalentHandler.setPendingCompletedResearch(client.character, classIndex, now);
 
-        await TalentHandler.saveCharacter(client);
+        await TalentHandler.completeTalentResearch(client, classIndex, false);
         TalentHandler.syncResearchTimer(client);
+        TalentHandler.sendTalentResearchComplete(client, classIndex);
     }
 
     static async handleTalentSpeedup(client: Client, data: Buffer): Promise<void> {
@@ -221,24 +226,25 @@ export class TalentHandler {
             return;
         }
 
-        if (idolCost > 0) {
+        const authoritativeCost = SpeedupPricing.reconcile(research.ReadyTime, idolCost);
+        if (authoritativeCost > 0) {
             const idols = Number(client.character.mammothIdols ?? 0);
-            if (idols < idolCost) {
+            if (idols < authoritativeCost) {
+                console.warn(
+                    `[Talent] Refused a Speed Up for ${client.character.name}: ` +
+                    `has ${idols} idols, needs ${authoritativeCost} (client claimed ${idolCost}).`
+                );
+                SpeedupPricing.refreshScreens(client);
                 return;
             }
 
-            client.character.mammothIdols = idols - idolCost;
+            client.character.mammothIdols = idols - authoritativeCost;
         }
 
-        client.character.talentResearch = {
-            ...research,
-            classIndex,
-            ReadyTime: 0
-        };
-
-        await TalentHandler.saveCharacter(client);
+        TalentHandler.setPendingCompletedResearch(client.character, classIndex, 0);
+        await TalentHandler.completeTalentResearch(client, classIndex, false);
         TalentHandler.syncResearchTimer(client);
-        TalentHandler.sendPremiumPurchase(client, 'TalentSpeedup', idolCost);
+        TalentHandler.sendPremiumPurchase(client, 'TalentSpeedup', authoritativeCost);
         TalentHandler.sendTalentResearchComplete(client, classIndex);
     }
 
@@ -253,18 +259,7 @@ export class TalentHandler {
             return;
         }
 
-        if (!client.character.talentPoints || typeof client.character.talentPoints !== 'object') {
-            client.character.talentPoints = {};
-        }
-
-        const key = String(classIndex);
-        client.character.talentPoints[key] = Number(client.character.talentPoints[key] ?? 0) + 1;
-        client.character.talentResearch = {
-            classIndex: null,
-            ReadyTime: 0
-        };
-
-        await TalentHandler.saveCharacter(client);
+        await TalentHandler.completeTalentResearch(client, classIndex, false);
         TalentHandler.syncResearchTimer(client);
 
         if (client.playerSpawned && client.currentLevel) {
@@ -360,6 +355,48 @@ export class TalentHandler {
             return {};
         }
         return research as TalentResearchRecord;
+    }
+
+    private static isValidTalentClassIndex(classIndex: number): boolean {
+        return Number.isFinite(classIndex) && classIndex >= 1 && classIndex <= 3;
+    }
+
+    private static setPendingCompletedResearch(character: Record<string, unknown>, classIndex: number, readyTime: number): void {
+        character.talentResearch = {
+            classIndex,
+            ReadyTime: readyTime
+        };
+    }
+
+    private static async completeTalentResearch(client: Client, classIndex: number, notifyClient: boolean): Promise<boolean> {
+        if (!client.character || !TalentHandler.isValidTalentClassIndex(classIndex)) {
+            return false;
+        }
+
+        const research = TalentHandler.getTalentResearch(client.character);
+        if (Number(research.classIndex ?? -1) !== classIndex) {
+            return false;
+        }
+
+        if (!client.character.talentPoints || typeof client.character.talentPoints !== 'object') {
+            client.character.talentPoints = {};
+        }
+
+        const key = String(classIndex);
+        const currentPoints = Math.max(0, Number(client.character.talentPoints[key] ?? 0));
+        client.character.talentPoints[key] = Math.min(currentPoints + 1, TalentHandler.MAX_TALENT_POINTS_PER_CLASS);
+        client.character.talentResearch = {
+            classIndex: null,
+            ReadyTime: 0
+        };
+
+        await TalentHandler.saveCharacter(client);
+
+        if (notifyClient) {
+            TalentHandler.sendTalentResearchComplete(client, classIndex);
+        }
+
+        return true;
     }
 
     private static clearResearchTimer(client: Client): void {

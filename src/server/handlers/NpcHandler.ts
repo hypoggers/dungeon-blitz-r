@@ -1,3 +1,4 @@
+import { Achievements } from '../core/Achievements';
 import { Client } from '../core/Client';
 import { GlobalState } from '../core/GlobalState';
 import { GameData } from '../core/GameData';
@@ -13,9 +14,16 @@ import { BitReader } from '../network/protocol/bitReader';
 import { getClientLevelScope } from '../core/LevelScope';
 import { RewardHandler } from './RewardHandler';
 import { MissionHandler } from './MissionHandler';
+import { HomeStatueHandler } from './HomeStatueHandler';
+import { LegendsInnGate } from '../core/LegendsInnGate';
 
 type MissionEntry = Record<string, any>;
 type ResolvedNpc = Record<string, any>;
+type ClearBanditsDialogueCursor = {
+    phase: 'offer' | 'return';
+    index: number;
+    initialOffer: boolean;
+};
 
 export class NpcHandler {
     private static readonly MISSION_NOT_STARTED = 0;
@@ -29,6 +37,28 @@ export class NpcHandler {
     private static readonly RETURN_DIALOGUE_CHAR_MS = 1;
     private static readonly DEFAULT_TURN_IN_STARS = 3;
     private static readonly DEFAULT_DIALOGUE_LANGUAGE = 'en';
+    private static readonly CLEAR_THE_BANDITS_DIALOGUE_CURSORS = new WeakMap<Client, ClearBanditsDialogueCursor>();
+    private static readonly CLEAR_THE_BANDITS_OFFER_LINES = [
+        { speaker: 'npc', text: 'Hey! Are you the slayer of Aracnaea?' },
+        { speaker: 'player', text: 'Yes, I am.' },
+        {
+            speaker: 'npc',
+            text: 'Hero please help me! I am really tired of the bandit problem. Could you kill some of them for me?'
+        },
+        { speaker: 'player', text: 'Okey I will do my best for our people.' }
+    ] as const;
+    private static readonly CLEAR_THE_BANDITS_RETURN_LINES = [
+        {
+            speaker: 'npc',
+            text: 'Thank you hero. Please accept this little gift. Maybe this could help for your adventure.'
+        },
+        {
+            speaker: 'player',
+            text: 'My pleasures. I will help all of you as much as I can. Good luck for guarding the bridge!'
+        },
+        { speaker: 'npc', text: 'Good luck to you, too. May your path be clear, great hero.' }
+    ] as const;
+    private static readonly ARCHIVIST_ENT_NAME = 'npchomeneo';
     private static readonly ATTACK_OF_OPPORTUNITY_MISSION_ID = 233;
     private static readonly ATTACK_OF_OPPORTUNITY_HARD_MISSION_ID = 254;
     private static readonly ATTACK_OF_OPPORTUNITY_SATELLITE_IDS = new Set([234, 235, 236]);
@@ -61,6 +91,23 @@ export class NpcHandler {
         }
     }
 
+    /**
+     * Reads the ledger out loud. The Home level never sends a talk packet -- it
+     * plays cue text locally (Game.method_668 branches on level a_Level_Home) --
+     * so walking up to Neo is what triggers this.
+     */
+    static speakAchievementLedger(client: Client, npcId: number): void {
+        if (!client.character) {
+            return;
+        }
+        const language = NpcHandler.getDialogueLanguage(client.character) === 'tr' ? 'tr' : 'en';
+        const ledger = Achievements.talk(client, language);
+        NpcHandler.sendNpcBubble(client, npcId, ledger.text);
+        if (ledger.didMutate && client.userId) {
+            NpcHandler.persistCharacter(client, 'achievement ledger');
+        }
+    }
+
     static handleTalkToNpc(client: Client, data: Buffer): void {
         if (!client.character) {
             return;
@@ -68,6 +115,22 @@ export class NpcHandler {
 
         const br = new BitReader(data);
         const npcId = br.readMethod9();
+
+        // Keep garden statues ride the same interact packet but have no dialogue of their own.
+        if (HomeStatueHandler.handleStatueInteract(client, npcId)) {
+            return;
+        }
+
+        // Titus, under the Legends' Inn portal. Dispatched on his entity id rather
+        // than on a dialogue key, because he borrows the keep cue Archivist Neo is
+        // clickable through and the two would otherwise answer to the same key.
+        // His lines are the dungeon's story told by someone who lost to it; the
+        // warning that gates the portal is separate and lives on the door.
+        if (LegendsInnGate.isTitus(npcId)) {
+            NpcHandler.sendNpcBubble(client, npcId, LegendsInnGate.getLine());
+            return;
+        }
+
         const levelName = String(client.currentLevel || client.character.CurrentLevel?.name || '');
         const npc = NpcHandler.findNpc(client, levelName, npcId);
 
@@ -79,13 +142,12 @@ export class NpcHandler {
         let delayedFirstMissionTurnIn = false;
 
         if (npc) {
-            const rawNpcKey = String(
-                npc.characterName ??
-                npc.character_name ??
-                npc.entType ??
-                npc.name ??
-                ''
-            );
+            // Authored NPCs carry an empty character_name, so skip blanks instead of
+            // letting the first defined-but-empty field win and key every one of them
+            // onto the '...' fallback line.
+            const rawNpcKey = [npc.characterName, npc.character_name, npc.entType, npc.name]
+                .map((value) => String(value ?? '').trim())
+                .find((value) => value !== '') ?? '';
             missionNpcKey = NpcHandler.normalizeMissionNpcKey(rawNpcKey);
             dialogueNpcKey = NpcHandler.normalizeNpcKey(rawNpcKey);
 
@@ -167,12 +229,16 @@ export class NpcHandler {
                         // Сначала показываем UI завершения миссии
                         const missionDef = MissionLoader.getMissionDef(missionId);
                         const missionEntry = NpcHandler.getMissionEntry(client.character, missionId);
-                        NpcHandler.sendMissionCompleteUi(
-                            client,
-                            missionId,
-                            NpcHandler.getMissionCompletionStars(missionDef, missionEntry),
-                            NpcHandler.getMissionCompletionScore(missionDef, missionEntry)
-                        );
+                        if (missionId === MissionID.ClearTheBandits) {
+                            NpcHandler.sendMissionClaimed(client, missionId);
+                        } else {
+                            NpcHandler.sendMissionCompleteUi(
+                                client,
+                                missionId,
+                                NpcHandler.getMissionCompletionStars(missionDef, missionEntry),
+                                NpcHandler.getMissionCompletionScore(missionDef, missionEntry)
+                            );
+                        }
 
                         // Затем начисляем награды
                         if (missionDef) {
@@ -181,9 +247,7 @@ export class NpcHandler {
 
                             // Начисление опыта
                             if (expReward > 0) {
-                                client.character.xp = Number(client.character.xp ?? 0) + expReward;
-                                client.character.level = GameData.getPlayerLevelFromXp(Number(client.character.xp ?? 0));
-                                NpcHandler.sendXpReward(client, expReward);
+                                RewardHandler.grantExperience(client, expReward);
                             }
 
                             // Начисление золота
@@ -230,6 +294,21 @@ export class NpcHandler {
             }
         }
 
+        if (npc && NpcHandler.normalizeNpcKey(String(npc.name ?? '')) === NpcHandler.ARCHIVIST_ENT_NAME) {
+            // Neo keeps the achievement ledger; talking to him is how it is read
+            // out and how its rewards are paid. Keyed on the entity name because
+            // his cue name is borrowed from the library tome -- the client refuses
+            // to interact with an entity whose character_name is not a cue the
+            // level actually authored.
+            const language = NpcHandler.getDialogueLanguage(client.character) === 'tr' ? 'tr' : 'en';
+            const ledger = Achievements.talk(client, language);
+            NpcHandler.sendNpcBubble(client, npcId, ledger.text);
+            if ((ledger.didMutate || didMutate) && client.userId) {
+                NpcHandler.persistCharacter(client, 'achievement ledger');
+            }
+            return;
+        }
+
         if (!dialogueId || !missionId) {
             NpcHandler.sendNpcBubble(
                 client,
@@ -241,6 +320,11 @@ export class NpcHandler {
 
         if (didMutate && client.userId) {
             NpcHandler.persistCharacter(client, 'npc dialogue mission update');
+        }
+
+        if (missionId === MissionID.ClearTheBandits) {
+            NpcHandler.sendClearTheBanditsDialogue(client, npcId, dialogueId);
+            return;
         }
 
         NpcHandler.sendResolvedDialogue(client, npcId, dialogueId, missionId);
@@ -764,10 +848,53 @@ export class NpcHandler {
         client.sendBitBuffer(0x84, bb);
     }
 
+    private static sendMissionClaimed(client: Client, missionId: number): void {
+        const bb = new BitBuffer(false);
+        bb.writeMethod4(missionId);
+        bb.writeMethod11(0, 1);
+        client.sendBitBuffer(0x84, bb);
+    }
+
     private static sendXpReward(client: Client, amount: number): void {
         const bb = new BitBuffer(false);
         bb.writeMethod4(amount);
         client.sendBitBuffer(0x2B, bb);
+    }
+
+    private static sendClearTheBanditsDialogue(client: Client, npcId: number, dialogueId: number): void {
+        if (!client.character) {
+            return;
+        }
+        const playerId = Math.max(0, Number(client.clientEntID ?? 0));
+        let cursor = NpcHandler.CLEAR_THE_BANDITS_DIALOGUE_CURSORS.get(client);
+
+        if (dialogueId === 2) {
+            cursor = { phase: 'offer', index: 0, initialOffer: true };
+        } else if (dialogueId === 4) {
+            cursor = { phase: 'return', index: 0, initialOffer: false };
+        } else if (dialogueId === 3 && cursor?.phase !== 'offer') {
+            cursor = { phase: 'offer', index: 0, initialOffer: false };
+        } else if (dialogueId === 5 && cursor?.phase !== 'return') {
+            cursor = { phase: 'return', index: 0, initialOffer: false };
+        }
+
+        if (!cursor) {
+            return;
+        }
+
+        const lines = cursor.phase === 'offer'
+            ? NpcHandler.CLEAR_THE_BANDITS_OFFER_LINES
+            : NpcHandler.CLEAR_THE_BANDITS_RETURN_LINES;
+        const line = lines[cursor.index];
+        const targetId = line.speaker === 'player' ? playerId : npcId;
+        NpcHandler.sendNpcBubble(client, targetId, line.text);
+
+        cursor.index += 1;
+        if (cursor.index < lines.length) {
+            NpcHandler.CLEAR_THE_BANDITS_DIALOGUE_CURSORS.set(client, cursor);
+        } else {
+            NpcHandler.CLEAR_THE_BANDITS_DIALOGUE_CURSORS.delete(client);
+        }
     }
 
     private static sendStartSkit(client: Client, npcId: number, dialogueId: number, missionId: number): void {
@@ -837,9 +964,7 @@ export class NpcHandler {
 
                 // Начисление опыта
                 if (expReward > 0) {
-                    client.character.xp = Number(client.character.xp ?? 0) + expReward;
-                    client.character.level = GameData.getPlayerLevelFromXp(Number(client.character.xp ?? 0));
-                    NpcHandler.sendXpReward(client, expReward);
+                    RewardHandler.grantExperience(client, expReward);
                 }
 
                 // Начисление золота

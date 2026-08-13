@@ -6,14 +6,16 @@ import { MissionDef, MissionLoader } from '../data/MissionLoader';
 import { BuildingID, ClassID, MasterClassID } from '../core/Enums';
 import { GameData } from '../core/GameData';
 import { GlobalState } from '../core/GlobalState';
-import { normalizeFriendEntries } from '../core/SocialState';
+import { clampSocialLevel, normalizeFriendEntries, sanitizeSocialText } from '../core/SocialState';
 import { normalizeGender } from './normalizeGender';
 import { getVisibleConsumableCount, reconcileConsumableSelectionState } from './ConsumableState';
 import { ensureSigilStoreAlertState } from './AlertState';
 import { writeSavedKeyBindings } from './KeyBindings';
 import { normalizeCharacterMaterials } from './MaterialInventory';
+import { CharmID } from '../data/runtime/Charms';
 
 export class WorldEnter {
+    private static readonly CLIENT_HIDDEN_MISSION_IDS = new Set<number>([11]);
     private static readonly MASTERCLASS_TO_BUILDING: Record<number, number> = {
         [MasterClassID.Executioner]: BuildingID.ExecutionerTower,
         [MasterClassID.Shadowwalker]: BuildingID.ShadowwalkerTower,
@@ -28,7 +30,7 @@ export class WorldEnter {
 
     private static readonly CLASS_TOWER_BUILDINGS: Record<string, number[]> = {
         rogue: [BuildingID.ExecutionerTower, BuildingID.ShadowwalkerTower, BuildingID.SoulthiefTower],
-        paladin: [BuildingID.JusticarTower, BuildingID.SentinelTower, BuildingID.TemplarTower],
+        paladin: [BuildingID.SentinelTower, BuildingID.JusticarTower, BuildingID.TemplarTower],
         mage: [BuildingID.FrostwardenTower, BuildingID.FlameseerTower, BuildingID.NecromancerTower]
     };
 
@@ -96,7 +98,11 @@ export class WorldEnter {
     }
 
     private static buildSerializableMissionsState(character: Character): Record<string, any> {
-        return { ...WorldEnter.asRecord(character.missions) };
+        const missions = { ...WorldEnter.asRecord(character.missions) };
+        for (const missionId of WorldEnter.CLIENT_HIDDEN_MISSION_IDS) {
+            delete missions[String(missionId)];
+        }
+        return missions;
     }
 
     private static normalizeMissionEntry(
@@ -417,32 +423,26 @@ export class WorldEnter {
 
     static getPlayerDataBuildingState(
         character: Character,
-        targetLevel: string = '',
-        buildingStateCharacter: Character | null = null
+        targetLevel: string = ''
     ): {
         magicForge: Record<string, any>;
         statsByBuilding: Record<string, unknown>;
         buildingUpgrade: Record<string, any>;
     } {
-        const sourceCharacter = buildingStateCharacter ?? character;
         return {
-            magicForge: WorldEnter.asRecord(sourceCharacter.magicForge),
-            statsByBuilding: WorldEnter.getTutorialSafeBuildingStatsForLevel(sourceCharacter, targetLevel),
-            buildingUpgrade: WorldEnter.getTutorialSafeBuildingUpgradeForLevel(sourceCharacter, targetLevel)
+            magicForge: WorldEnter.asRecord(character.magicForge),
+            statsByBuilding: WorldEnter.getTutorialSafeBuildingStatsForLevel(character, targetLevel),
+            buildingUpgrade: WorldEnter.getTutorialSafeBuildingUpgradeForLevel(character, targetLevel)
         };
     }
 
-    static getPlayerDataBuildingOrder(
-        character: Character,
-        buildingStateCharacter: Character | null = null
-    ): number[] {
-        const buildingStateSource = buildingStateCharacter ?? character;
-        const className = (buildingStateSource.class || character.class || '').toLowerCase();
+    static getPlayerDataBuildingOrder(character: Character): number[] {
+        const className = (character.class || '').toLowerCase();
         return className === 'mage'
             ? [2, 12, 6, 7, 8, 1, 13]
             : className === 'rogue'
                 ? [2, 12, 9, 10, 11, 1, 13]
-                : [2, 12, 3, 4, 5, 1, 13];
+                : [2, 12, 4, 3, 5, 1, 13];
     }
 
     static resolveMasterClass(char: Character): number {
@@ -510,6 +510,18 @@ export class WorldEnter {
         };
     }
 
+    private static ownsPrimaryCharm(character: Character, primaryId: number): boolean {
+        const charms = WorldEnter.asArray(character.charms);
+        return charms.some((entry) => (Number(entry?.charmID ?? 0) & 0x1FF) === primaryId && Number(entry?.count ?? 0) > 0);
+    }
+
+    private static shouldUseExtendedRespecForge(character: Character, magicForge: Record<string, any>): boolean {
+        return Boolean(magicForge.is_extended_forge) ||
+            Boolean(character.forgeMilestones?.initial_respec_stone_crafted) ||
+            Number(magicForge.respec_duration_seconds ?? 0) === 86400 ||
+            WorldEnter.ownsPrimaryCharm(character, CharmID.RespecStone);
+    }
+
     static buildPlayerDataPacket(
         character: Character,
         transferToken: number,
@@ -519,8 +531,7 @@ export class WorldEnter {
         newX: number = 0,
         newY: number = 0,
         newHasCoord: boolean = false,
-        sendExtended: boolean = false,
-        buildingStateCharacter: Character | null = null
+        sendExtended: boolean = false
     ): BitBuffer {
         const bb = new BitBuffer();
         const now = Math.floor(Date.now() / 1000);
@@ -532,11 +543,7 @@ export class WorldEnter {
         }
         reconcileConsumableSelectionState(character);
         const equippedGears = WorldEnter.asArray(character.equippedGears);
-        const buildingStateSource = buildingStateCharacter ?? character;
-        if (buildingStateCharacter && buildingStateCharacter !== character) {
-            WorldEnter.ensureSelectedDisciplineTower(buildingStateCharacter);
-        }
-        const buildingState = WorldEnter.getPlayerDataBuildingState(character, targetLevel, buildingStateCharacter);
+        const buildingState = WorldEnter.getPlayerDataBuildingState(character, targetLevel);
         const safeStatsByBuilding = buildingState.statsByBuilding;
         const safeBuildingUpgrade = buildingState.buildingUpgrade;
 
@@ -640,7 +647,8 @@ export class WorldEnter {
             }
 
             const gearSets = WorldEnter.asArray(character.gearSets);
-            bb.writeMethod6(gearSets.length, 3);
+            // GearType.const_348 in the patched client: 4 bits, so up to 10 gear sets.
+            bb.writeMethod6(gearSets.length, 4);
             for (const rawGearSet of gearSets) {
                 const gearSet = WorldEnter.asRecord(rawGearSet);
                 const slots = WorldEnter.asArray(gearSet.slots).slice(0, 7);
@@ -757,7 +765,7 @@ export class WorldEnter {
             const friends = normalizeFriendEntries(character.friends);
             bb.writeMethod4(friends.length);
             for (const friend of friends) {
-                const friendName = String(friend.name ?? '');
+                const friendName = sanitizeSocialText(friend.name, 'Unknown');
                 const isRequest = Boolean(friend.isRequest);
                 let isOnline = false;
                 let className = '';
@@ -767,7 +775,7 @@ export class WorldEnter {
                 if (session?.character) {
                     isOnline = true;
                     className = String(session.character.class ?? '');
-                    level = Number(session.character.level ?? 1);
+                    level = clampSocialLevel(session.character.level);
                 }
 
                 bb.writeMethod13(friendName);
@@ -816,7 +824,7 @@ export class WorldEnter {
             const hasForgeStats = Object.keys(statsByBuilding).length > 0;
             bb.writeMethod11(hasForgeStats ? 1 : 0, 1);
             if (hasForgeStats) {
-                const buildOrder = WorldEnter.getPlayerDataBuildingOrder(character, buildingStateSource);
+                const buildOrder = WorldEnter.getPlayerDataBuildingOrder(character);
 
                 for (const buildingId of buildOrder) {
                     bb.writeMethod6(Number(statsByBuilding[buildingId.toString()] ?? 0), 5);
@@ -844,7 +852,7 @@ export class WorldEnter {
                 bb.writeMethod91(Math.min(Number(magicForge.forge_roll_b ?? 0), 65535));
             }
 
-            bb.writeMethod11(Boolean(magicForge.is_extended_forge) ? 1 : 0, 1);
+            bb.writeMethod11(WorldEnter.shouldUseExtendedRespecForge(character, magicForge) ? 1 : 0, 1);
 
             const skillResearch = WorldEnter.asRecord(character.SkillResearch);
             const skillResearchAbilityId = Number(skillResearch.abilityID ?? 0);
@@ -885,7 +893,8 @@ export class WorldEnter {
                 bb.writeMethod11(0, 1);
             }
 
-            const ownedEggs = WorldEnter.asArray(character.OwnedEggsID).slice(0, 8);
+            const hatcheryEggs = PetHandler.ensureAvailableHatcheryEggs(character, now);
+            const ownedEggs = hatcheryEggs.owned.slice(0, 8);
             while (ownedEggs.length < 8) {
                 ownedEggs.push(0);
             }

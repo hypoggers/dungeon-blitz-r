@@ -217,6 +217,22 @@
 			<AnimClass>a_PoisonDot4</AnimClass>
 		</GfxType>
 	</BuffType>
+	<BuffType BuffName="ShadowLegionPoisonStrike">
+		<BuffID>743</BuffID>
+		<Attack>true</Attack>
+		<Duration>5000</Duration>
+		<DoTDamage>2</DoTDamage>
+		<DoTTickLength>1000</DoTTickLength>
+		<Effect>Poisoned</Effect>
+		<StackCount>1</StackCount>
+		<BuffLoc>Head</BuffLoc>
+		<BuffIcon>a_StatusIcon_Poisoned</BuffIcon>
+		<GfxType>
+			<AnimScale>0.8</AnimScale>
+			<AnimFile>SFX_2.swf</AnimFile>
+			<AnimClass>a_PoisonDot4</AnimClass>
+		</GfxType>
+	</BuffType>
 	<BuffType BuffName="ReduceArmor">
 		<BuffID>19</BuffID>
 		<Attack>true</Attack>
@@ -286,6 +302,19 @@
 			<AnimClass>a_Debuff_Slow</AnimClass>
 		</GfxType>
 	</BuffType>
+	<BuffType BuffName="ShadowLegionCrippled">
+		<BuffID>746</BuffID>
+		<Attack>true</Attack>
+		<Duration>5000</Duration>
+		<SpeedChange>-0.1</SpeedChange>
+		<StackCount>1</StackCount>
+		<BuffIcon>a_StatusIcon_SpeedDown</BuffIcon>
+		<GfxType>
+			<AnimScale>0.7</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_Debuff_Slow</AnimClass>
+		</GfxType>
+	</BuffType>
 	<BuffType BuffName="MistArmor">
 		<BuffID>24</BuffID>
 		<Attack>false</Attack>
@@ -302,6 +331,21 @@
 		<MagicDefense>-0.05</MagicDefense>
 		<MeleeDefense>-0.05</MeleeDefense>
 		<StackCount>7</StackCount>
+		<BuffLoc>Head</BuffLoc>
+		<BuffIcon>a_StatusIcon_DefenseDown</BuffIcon>
+		<GfxType>
+			<AnimScale>0.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_Debuff_Armor</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="ShadowLegionArmorBane">
+		<BuffID>744</BuffID>
+		<Attack>true</Attack>
+		<Duration>5000</Duration>
+		<MagicDefense>-0.05</MagicDefense>
+		<MeleeDefense>-0.05</MeleeDefense>
+		<StackCount>1</StackCount>
 		<BuffLoc>Head</BuffLoc>
 		<BuffIcon>a_StatusIcon_DefenseDown</BuffIcon>
 		<GfxType>
@@ -329,6 +373,20 @@
 		<Duration>5000</Duration>
 		<MeleeDamage>-0.1</MeleeDamage>
 		<StackCount>5</StackCount>
+		<BuffLoc>Head</BuffLoc>
+		<BuffIcon>a_StatusIcon_AttackDown</BuffIcon>
+		<GfxType>
+			<AnimScale>0.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_Debuff_Weaken</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="ShadowLegionWeakened">
+		<BuffID>747</BuffID>
+		<Attack>true</Attack>
+		<Duration>5000</Duration>
+		<MeleeDamage>-0.1</MeleeDamage>
+		<StackCount>1</StackCount>
 		<BuffLoc>Head</BuffLoc>
 		<BuffIcon>a_StatusIcon_AttackDown</BuffIcon>
 		<GfxType>
@@ -406,6 +464,22 @@
 		<DoTDamage>1</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<StackCount>3</StackCount>
+		<BuffLoc>Feet</BuffLoc>
+		<BuffIcon>a_StatusIcon_AttackDown</BuffIcon>
+		<GfxType>
+			<AnimScale>2</AnimScale>
+			<AnimFile>SFX_3.swf</AnimFile>
+			<AnimClass>a_BindSoulThief</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="ShadowLegionBound">
+		<BuffID>745</BuffID>
+		<Attack>true</Attack>
+		<Duration>5000</Duration>
+		<MeleeDamage>-0.1</MeleeDamage>
+		<DoTDamage>1</DoTDamage>
+		<DoTTickLength>1000</DoTTickLength>
+		<StackCount>1</StackCount>
 		<BuffLoc>Feet</BuffLoc>
 		<BuffIcon>a_StatusIcon_AttackDown</BuffIcon>
 		<GfxType>
@@ -1052,8 +1126,8 @@
 		<BuffID>302</BuffID>
 		<Attack>true</Attack>
 		<Duration>500</Duration>
-		<MagicDefense>-0.3</MagicDefense>
-		<MeleeDefense>-0.3</MeleeDefense>
+		<MagicDefense>-0.06</MagicDefense>
+		<MeleeDefense>-0.06</MeleeDefense>
 		<DoTTickLength>500</DoTTickLength>
 		<BuffIcon>a_StatusIcon_DefenseDown</BuffIcon>
 		<GfxType/>
@@ -1237,7 +1311,7 @@
 	<BuffType BuffName="Verdict9">
 		<BuffID>322</BuffID>
 		<Attack>false</Attack>
-		<Duration>5500</Duration>
+		<Duration>7000</Duration>
 		<RangedOverride>VerdictROR9</RangedOverride>
 		<MeleeOverride>VerdictMelee9</MeleeOverride>
 		<GfxType>
@@ -1249,7 +1323,7 @@
 	<BuffType BuffName="Verdict10">
 		<BuffID>323</BuffID>
 		<Attack>false</Attack>
-		<Duration>5500</Duration>
+		<Duration>7000</Duration>
 		<RangedOverride>VerdictROR10</RangedOverride>
 		<MeleeOverride>VerdictMelee10</MeleeOverride>
 		<GfxType>
@@ -2407,8 +2481,8 @@
 		<BuffID>441</BuffID>
 		<Attack>true</Attack>
 		<Duration>600</Duration>
-		<MagicDefense>-0.3</MagicDefense>
-		<MeleeDefense>-0.3</MeleeDefense>
+		<MagicDefense>-0.06</MagicDefense>
+		<MeleeDefense>-0.06</MeleeDefense>
 		<DoTTickLength>600</DoTTickLength>
 		<BuffIcon>a_StatusIcon_DefenseDown,a_StatusIcon_SpeedDown</BuffIcon>
 		<GfxType/>
@@ -2417,8 +2491,8 @@
 		<BuffID>442</BuffID>
 		<Attack>true</Attack>
 		<Duration>600</Duration>
-		<MagicDefense>-0.3</MagicDefense>
-		<MeleeDefense>-0.3</MeleeDefense>
+		<MagicDefense>-0.06</MagicDefense>
+		<MeleeDefense>-0.06</MeleeDefense>
 		<DoTTickLength>600</DoTTickLength>
 		<SpeedChange>-0.3</SpeedChange>
 		<BuffIcon>a_StatusIcon_DefenseDown,a_StatusIcon_SpeedDown</BuffIcon>
@@ -2428,8 +2502,8 @@
 		<BuffID>443</BuffID>
 		<Attack>true</Attack>
 		<Duration>600</Duration>
-		<MagicDefense>-0.4</MagicDefense>
-		<MeleeDefense>-0.4</MeleeDefense>
+		<MagicDefense>-0.08</MagicDefense>
+		<MeleeDefense>-0.08</MeleeDefense>
 		<DoTTickLength>600</DoTTickLength>
 		<SpeedChange>-0.3</SpeedChange>
 		<BuffIcon>a_StatusIcon_DefenseDown,a_StatusIcon_SpeedDown</BuffIcon>
@@ -2439,8 +2513,8 @@
 		<BuffID>444</BuffID>
 		<Attack>true</Attack>
 		<Duration>600</Duration>
-		<MagicDefense>-0.4</MagicDefense>
-		<MeleeDefense>-0.4</MeleeDefense>
+		<MagicDefense>-0.08</MagicDefense>
+		<MeleeDefense>-0.08</MeleeDefense>
 		<DoTTickLength>600</DoTTickLength>
 		<SpeedChange>-0.4</SpeedChange>
 		<BuffIcon>a_StatusIcon_DefenseDown,a_StatusIcon_SpeedDown</BuffIcon>
@@ -2450,8 +2524,8 @@
 		<BuffID>445</BuffID>
 		<Attack>true</Attack>
 		<Duration>600</Duration>
-		<MagicDefense>-0.5</MagicDefense>
-		<MeleeDefense>-0.5</MeleeDefense>
+		<MagicDefense>-0.1</MagicDefense>
+		<MeleeDefense>-0.1</MeleeDefense>
 		<DoTTickLength>600</DoTTickLength>
 		<SpeedChange>-0.4</SpeedChange>
 		<BuffIcon>a_StatusIcon_DefenseDown,a_StatusIcon_SpeedDown</BuffIcon>
@@ -3637,8 +3711,10 @@
 		<BuffID>551</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MagicDefense>0.6</MagicDefense>
-		<MeleeDefense>0.6</MeleeDefense>
+		<MeleeDamage>0.1</MeleeDamage>
+		<MagicDamage>0.1</MagicDamage>
+		<MagicDefense>0.65</MagicDefense>
+		<MeleeDefense>0.65</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1</AggroChange>
 		<RangedOverride>SFRanged1</RangedOverride>
@@ -3649,8 +3725,10 @@
 		<BuffID>552</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MagicDefense>0.6</MagicDefense>
-		<MeleeDefense>0.6</MeleeDefense>
+		<MeleeDamage>0.1</MeleeDamage>
+		<MagicDamage>0.1</MagicDamage>
+		<MagicDefense>0.65</MagicDefense>
+		<MeleeDefense>0.65</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1</AggroChange>
 		<RangedOverride>SFRanged2</RangedOverride>
@@ -3661,8 +3739,10 @@
 		<BuffID>553</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MagicDefense>0.6</MagicDefense>
-		<MeleeDefense>0.6</MeleeDefense>
+		<MeleeDamage>0.1</MeleeDamage>
+		<MagicDamage>0.1</MagicDamage>
+		<MagicDefense>0.65</MagicDefense>
+		<MeleeDefense>0.65</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1</AggroChange>
 		<RangedOverride>SFRanged3</RangedOverride>
@@ -3673,9 +3753,10 @@
 		<BuffID>554</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.05</MeleeDamage>
-		<MagicDefense>0.7</MagicDefense>
-		<MeleeDefense>0.7</MeleeDefense>
+		<MeleeDamage>0.15</MeleeDamage>
+		<MagicDamage>0.15</MagicDamage>
+		<MagicDefense>0.75</MagicDefense>
+		<MeleeDefense>0.75</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1.5</AggroChange>
 		<RangedOverride>SFRanged3</RangedOverride>
@@ -3686,9 +3767,10 @@
 		<BuffID>555</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.05</MeleeDamage>
-		<MagicDefense>0.7</MagicDefense>
-		<MeleeDefense>0.7</MeleeDefense>
+		<MeleeDamage>0.15</MeleeDamage>
+		<MagicDamage>0.15</MagicDamage>
+		<MagicDefense>0.75</MagicDefense>
+		<MeleeDefense>0.75</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1.5</AggroChange>
 		<RangedOverride>SFRanged3</RangedOverride>
@@ -3699,9 +3781,10 @@
 		<BuffID>556</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.05</MeleeDamage>
-		<MagicDefense>0.7</MagicDefense>
-		<MeleeDefense>0.7</MeleeDefense>
+		<MeleeDamage>0.15</MeleeDamage>
+		<MagicDamage>0.15</MagicDamage>
+		<MagicDefense>0.75</MagicDefense>
+		<MeleeDefense>0.75</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>1.5</AggroChange>
 		<RangedOverride>SFRanged6</RangedOverride>
@@ -3712,9 +3795,10 @@
 		<BuffID>557</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.1</MeleeDamage>
-		<MagicDefense>0.75</MagicDefense>
-		<MeleeDefense>0.75</MeleeDefense>
+		<MeleeDamage>0.2</MeleeDamage>
+		<MagicDamage>0.2</MagicDamage>
+		<MagicDefense>0.8</MagicDefense>
+		<MeleeDefense>0.8</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>2</AggroChange>
 		<RangedOverride>SFRanged6</RangedOverride>
@@ -3725,9 +3809,10 @@
 		<BuffID>558</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.1</MeleeDamage>
-		<MagicDefense>0.75</MagicDefense>
-		<MeleeDefense>0.75</MeleeDefense>
+		<MeleeDamage>0.2</MeleeDamage>
+		<MagicDamage>0.2</MagicDamage>
+		<MagicDefense>0.8</MagicDefense>
+		<MeleeDefense>0.8</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>2</AggroChange>
 		<RangedOverride>SFRanged8</RangedOverride>
@@ -3738,9 +3823,10 @@
 		<BuffID>559</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.1</MeleeDamage>
-		<MagicDefense>0.75</MagicDefense>
-		<MeleeDefense>0.75</MeleeDefense>
+		<MeleeDamage>0.2</MeleeDamage>
+		<MagicDamage>0.2</MagicDamage>
+		<MagicDefense>0.8</MagicDefense>
+		<MeleeDefense>0.8</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>2</AggroChange>
 		<RangedOverride>SFRanged9</RangedOverride>
@@ -3751,9 +3837,10 @@
 		<BuffID>560</BuffID>
 		<Attack>false</Attack>
 		<Duration>0</Duration>
-		<MeleeDamage>0.1</MeleeDamage>
-		<MagicDefense>0.75</MagicDefense>
-		<MeleeDefense>0.75</MeleeDefense>
+		<MeleeDamage>0.2</MeleeDamage>
+		<MagicDamage>0.2</MagicDamage>
+		<MagicDefense>0.8</MagicDefense>
+		<MeleeDefense>0.8</MeleeDefense>
 		<SpeedChange>-0.5</SpeedChange>
 		<AggroChange>2</AggroChange>
 		<RangedOverride>SFRanged10</RangedOverride>
@@ -3799,30 +3886,40 @@
 		<BuffID>566</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDefense>0.01</MagicDefense>
+		<MeleeDefense>0.01</MeleeDefense>
 		<GfxType/>
 	</BuffType>
 	<BuffType BuffName="PainEaterRank2">
 		<BuffID>567</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDefense>0.02</MagicDefense>
+		<MeleeDefense>0.02</MeleeDefense>
 		<GfxType/>
 	</BuffType>
 	<BuffType BuffName="PainEaterRank3">
 		<BuffID>568</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDefense>0.04</MagicDefense>
+		<MeleeDefense>0.04</MeleeDefense>
 		<GfxType/>
 	</BuffType>
 	<BuffType BuffName="PainEaterRank4">
 		<BuffID>569</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDefense>0.06</MagicDefense>
+		<MeleeDefense>0.06</MeleeDefense>
 		<GfxType/>
 	</BuffType>
 	<BuffType BuffName="PainEaterRank5">
 		<BuffID>570</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDefense>0.1</MagicDefense>
+		<MeleeDefense>0.1</MeleeDefense>
 		<GfxType/>
 	</BuffType>
 	<BuffType BuffName="HeroismRank1">
@@ -3864,7 +3961,7 @@
 	<BuffType BuffName="PetGhostRoot">
 		<BuffID>577</BuffID>
 		<Attack>true</Attack>
-		<Duration>9750</Duration>
+		<Duration>14625</Duration>
 		<SpeedChange>-1</SpeedChange>
 		<BuffLoc>Feet</BuffLoc>
 		<BuffIcon>a_StatusIcon_Immobile</BuffIcon>
@@ -3877,9 +3974,9 @@
 	<BuffType BuffName="PetGhoulEnfeeble">
 		<BuffID>578</BuffID>
 		<Attack>true</Attack>
-		<Duration>10000</Duration>
-		<MagicDamage>-0.24</MagicDamage>
-		<MeleeDamage>-0.24</MeleeDamage>
+		<Duration>15000</Duration>
+		<MagicDamage>-0.3</MagicDamage>
+		<MeleeDamage>-0.3</MeleeDamage>
 		<BuffLoc>Head</BuffLoc>
 		<BuffIcon>a_StatusIcon_AttackDown</BuffIcon>
 		<GfxType>
@@ -3891,7 +3988,7 @@
 	<BuffType BuffName="PetFairyBlind">
 		<BuffID>579</BuffID>
 		<Attack>true</Attack>
-		<Duration>9720</Duration>
+		<Duration>14580</Duration>
 		<BuffLoc>Head</BuffLoc>
 		<GfxType>
 			<AnimScale>0.75</AnimScale>
@@ -3903,10 +4000,10 @@
 	<BuffType BuffName="PetCrowBlind">
 		<BuffID>580</BuffID>
 		<Attack>true</Attack>
-		<Duration>5000</Duration>
-		<MagicDamage>-0.25</MagicDamage>
-		<MeleeDamage>-0.25</MeleeDamage>
-		<DoTDamage>5.4</DoTDamage>
+		<Duration>8000</Duration>
+		<MagicDamage>-0.3</MagicDamage>
+		<MeleeDamage>-0.3</MeleeDamage>
+		<DoTDamage>10.8</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<SpeedChange>-0.4</SpeedChange>
 		<BuffLoc>Head</BuffLoc>
@@ -3920,9 +4017,9 @@
 	<BuffType BuffName="PetMonkeyHaste">
 		<BuffID>581</BuffID>
 		<Attack>false</Attack>
-		<Duration>10000</Duration>
-		<MagicDamage>0.1</MagicDamage>
-		<MeleeDamage>0.1</MeleeDamage>
+		<Duration>15000</Duration>
+		<MagicDamage>0.15</MagicDamage>
+		<MeleeDamage>0.15</MeleeDamage>
 		<SpeedChange>0.03</SpeedChange>
 		<GfxType>
 			<AnimScale>1</AnimScale>
@@ -3935,8 +4032,8 @@
 		<BuffID>582</BuffID>
 		<Attack>false</Attack>
 		<Duration>1000</Duration>
-		<MagicDefense>0.3</MagicDefense>
-		<MeleeDefense>0.3</MeleeDefense>
+		<MagicDefense>0.35</MagicDefense>
+		<MeleeDefense>0.35</MeleeDefense>
 		<DoTDamage>-1</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Head</BuffLoc>
@@ -3949,9 +4046,9 @@
 	<BuffType BuffName="PetOwlDefense">
 		<BuffID>583</BuffID>
 		<Attack>false</Attack>
-		<Duration>12500</Duration>
-		<MagicDefense>0.25</MagicDefense>
-		<MeleeDefense>0.25</MeleeDefense>
+		<Duration>18750</Duration>
+		<MagicDefense>0.3</MagicDefense>
+		<MeleeDefense>0.3</MeleeDefense>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
 			<AnimScale>3</AnimScale>
@@ -3962,8 +4059,8 @@
 	<BuffType BuffName="PetDragonBonePoison">
 		<BuffID>584</BuffID>
 		<Attack>true</Attack>
-		<Duration>8000</Duration>
-		<DoTDamage>6</DoTDamage>
+		<Duration>12000</Duration>
+		<DoTDamage>12</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
 		<BuffLoc>Head</BuffLoc>
@@ -3976,8 +4073,8 @@
 	<BuffType BuffName="PetSpriteBurn">
 		<BuffID>585</BuffID>
 		<Attack>true</Attack>
-		<Duration>5000</Duration>
-		<DoTDamage>1.6</DoTDamage>
+		<Duration>8000</Duration>
+		<DoTDamage>3.2</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Tick</BuffLoc>
 		<GfxType>
@@ -4015,7 +4112,7 @@
 		<BuffID>594</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-5.194</DoTDamage>
+		<DoTDamage>-2.597</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4043,7 +4140,7 @@
 		<BuffID>596</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-5.194</DoTDamage>
+		<DoTDamage>-2.597</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4071,7 +4168,7 @@
 		<BuffID>598</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-6.233</DoTDamage>
+		<DoTDamage>-3.117</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4099,7 +4196,7 @@
 		<BuffID>600</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-6.233</DoTDamage>
+		<DoTDamage>-3.117</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4127,7 +4224,7 @@
 		<BuffID>602</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-7.112</DoTDamage>
+		<DoTDamage>-3.556</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4155,7 +4252,7 @@
 		<BuffID>604</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-7.112</DoTDamage>
+		<DoTDamage>-3.556</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4183,7 +4280,7 @@
 		<BuffID>606</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-8.95</DoTDamage>
+		<DoTDamage>-4.475</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4211,7 +4308,7 @@
 		<BuffID>608</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-8.95</DoTDamage>
+		<DoTDamage>-4.475</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4239,7 +4336,7 @@
 		<BuffID>610</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-9.749</DoTDamage>
+		<DoTDamage>-4.875</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4267,7 +4364,7 @@
 		<BuffID>612</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
-		<DoTDamage>-10.484</DoTDamage>
+		<DoTDamage>-5.242</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<GfxType>
 			<AnimScale>1.9</AnimScale>
@@ -4279,6 +4376,7 @@
 		<BuffID>613</BuffID>
 		<Attack>false</Attack>
 		<Duration>4000</Duration>
+		<MagicDamage>0.2</MagicDamage>
 		<MeleeDamage>0.2</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4291,6 +4389,7 @@
 		<BuffID>614</BuffID>
 		<Attack>false</Attack>
 		<Duration>4000</Duration>
+		<MagicDamage>0.25</MagicDamage>
 		<MeleeDamage>0.25</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4303,6 +4402,7 @@
 		<BuffID>615</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDamage>0.25</MagicDamage>
 		<MeleeDamage>0.25</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4315,6 +4415,7 @@
 		<BuffID>616</BuffID>
 		<Attack>false</Attack>
 		<Duration>5000</Duration>
+		<MagicDamage>0.3</MagicDamage>
 		<MeleeDamage>0.3</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4327,6 +4428,7 @@
 		<BuffID>617</BuffID>
 		<Attack>false</Attack>
 		<Duration>6000</Duration>
+		<MagicDamage>0.3</MagicDamage>
 		<MeleeDamage>0.3</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4339,6 +4441,7 @@
 		<BuffID>618</BuffID>
 		<Attack>false</Attack>
 		<Duration>6000</Duration>
+		<MagicDamage>0.35</MagicDamage>
 		<MeleeDamage>0.35</MeleeDamage>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4705,7 +4808,7 @@
 		<BuffID>646</BuffID>
 		<Attack>false</Attack>
 		<Duration>3000</Duration>
-		<DoTDamage>-0.75</DoTDamage>
+		<DoTDamage>-0.9375</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4718,7 +4821,7 @@
 		<BuffID>647</BuffID>
 		<Attack>false</Attack>
 		<Duration>3000</Duration>
-		<DoTDamage>-1</DoTDamage>
+		<DoTDamage>-1.25</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4731,7 +4834,7 @@
 		<BuffID>648</BuffID>
 		<Attack>false</Attack>
 		<Duration>3000</Duration>
-		<DoTDamage>-1.25</DoTDamage>
+		<DoTDamage>-1.5625</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<BuffLoc>Feet</BuffLoc>
 		<GfxType>
@@ -4799,7 +4902,7 @@
 	<BuffType BuffName="LeoneanAura1">
 		<BuffID>653</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.15</MagicDamage>
 		<MeleeDamage>0.15</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4812,7 +4915,7 @@
 	<BuffType BuffName="LeoneanAura2">
 		<BuffID>654</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.16</MagicDamage>
 		<MeleeDamage>0.16</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4825,7 +4928,7 @@
 	<BuffType BuffName="LeoneanAura3">
 		<BuffID>655</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.18</MagicDamage>
 		<MeleeDamage>0.18</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4838,7 +4941,7 @@
 	<BuffType BuffName="LeoneanAura4">
 		<BuffID>656</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.19</MagicDamage>
 		<MeleeDamage>0.19</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4851,7 +4954,7 @@
 	<BuffType BuffName="LeoneanAura5">
 		<BuffID>657</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.2</MagicDamage>
 		<MeleeDamage>0.2</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4864,7 +4967,7 @@
 	<BuffType BuffName="LeoneanAura6">
 		<BuffID>658</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.25</MagicDamage>
 		<MeleeDamage>0.25</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4877,7 +4980,7 @@
 	<BuffType BuffName="LeoneanAura7">
 		<BuffID>659</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.26</MagicDamage>
 		<MeleeDamage>0.26</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4890,7 +4993,7 @@
 	<BuffType BuffName="LeoneanAura8">
 		<BuffID>660</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.28</MagicDamage>
 		<MeleeDamage>0.28</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4903,7 +5006,7 @@
 	<BuffType BuffName="LeoneanAura9">
 		<BuffID>661</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.3</MagicDamage>
 		<MeleeDamage>0.3</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4916,7 +5019,7 @@
 	<BuffType BuffName="LeoneanAura10">
 		<BuffID>662</BuffID>
 		<Attack>false</Attack>
-		<Duration>750</Duration>
+		<Duration>4000</Duration>
 		<MagicDamage>0.33</MagicDamage>
 		<MeleeDamage>0.33</MeleeDamage>
 		<BuffLoc>FeetBack</BuffLoc>
@@ -4932,7 +5035,7 @@
 		<Duration>5000</Duration>
 		<DoTDamage>1</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
-		<StackCount>2</StackCount>
+		<StackCount>3</StackCount>
 		<BuffLoc>Chest</BuffLoc>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
@@ -4946,7 +5049,7 @@
 		<Duration>5000</Duration>
 		<DoTDamage>1.3</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
-		<StackCount>2</StackCount>
+		<StackCount>3</StackCount>
 		<BuffLoc>Chest</BuffLoc>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
@@ -4960,7 +5063,7 @@
 		<Duration>5000</Duration>
 		<DoTDamage>1.6</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
-		<StackCount>2</StackCount>
+		<StackCount>3</StackCount>
 		<BuffLoc>Chest</BuffLoc>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
@@ -4974,7 +5077,7 @@
 		<Duration>5000</Duration>
 		<DoTDamage>2</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
-		<StackCount>2</StackCount>
+		<StackCount>3</StackCount>
 		<BuffLoc>Chest</BuffLoc>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
@@ -4988,7 +5091,7 @@
 		<Duration>5000</Duration>
 		<DoTDamage>2.5</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
-		<StackCount>2</StackCount>
+		<StackCount>3</StackCount>
 		<BuffLoc>Chest</BuffLoc>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
@@ -5498,6 +5601,8 @@
 		<BuffID>719</BuffID>
 		<Attack>false</Attack>
 		<Duration>10000</Duration>
+		<RangedOverride>PlagueBattalionROR1</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee1</MeleeOverride>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5511,7 +5616,7 @@
 		<DoTDamage>2.5</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>4</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5525,7 +5630,7 @@
 		<DoTDamage>2.75</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>4</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5539,7 +5644,7 @@
 		<DoTDamage>2.75</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>4</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5553,7 +5658,7 @@
 		<DoTDamage>2.85</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>4</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5567,7 +5672,7 @@
 		<DoTDamage>2.85</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>5</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5581,7 +5686,7 @@
 		<DoTDamage>3.05</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>5</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5595,7 +5700,7 @@
 		<DoTDamage>3.05</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>5</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5609,7 +5714,7 @@
 		<DoTDamage>3.15</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>5</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5623,7 +5728,7 @@
 		<DoTDamage>3.3</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>5</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5637,7 +5742,7 @@
 		<DoTDamage>3.3</DoTDamage>
 		<DoTTickLength>1000</DoTTickLength>
 		<Effect>Poisoned</Effect>
-		<StackCount>6</StackCount>
+		<StackCount>1</StackCount>
 		<GfxType>
 			<AnimScale>1.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
@@ -5732,6 +5837,256 @@
 			<AnimScale>0.5</AnimScale>
 			<AnimFile>SFX_1.swf</AnimFile>
 			<AnimClass>a_Debuff_Poison</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="ViperbladePoison">
+			<BuffID>741</BuffID>
+			<Attack>true</Attack>
+			<Duration>5000</Duration>
+			<DoTDamage>1.5</DoTDamage>
+			<DoTTickLength>1000</DoTTickLength>
+			<Effect>Poisoned</Effect>
+			<StackCount>1</StackCount>
+			<BuffLoc>Head</BuffLoc>
+			<BuffIcon>a_StatusIcon_Poisoned</BuffIcon>
+		</BuffType>
+	<BuffType BuffName="SentinelFury">
+			<BuffID>742</BuffID>
+			<Attack>false</Attack>
+			<Duration>0</Duration>
+			<MagicDamage>0.6</MagicDamage>
+			<MeleeDamage>0.6</MeleeDamage>
+			<EntTint>0xFF3030</EntTint>
+			<GfxType/>
+		</BuffType>
+	<BuffType BuffName="PlagueBattalion1">
+		<BuffID>800</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR1</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee1</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion2">
+		<BuffID>801</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR2</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee2</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion3">
+		<BuffID>802</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR3</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee3</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion4">
+		<BuffID>803</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR4</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee4</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion5">
+		<BuffID>804</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR5</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee5</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion6">
+		<BuffID>805</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR6</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee6</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion7">
+		<BuffID>806</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR7</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee7</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion8">
+		<BuffID>807</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR8</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee8</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion9">
+		<BuffID>808</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR9</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee9</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalion10">
+		<BuffID>809</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<RangedOverride>PlagueBattalionROR10</RangedOverride>
+		<MeleeOverride>PlagueBattalionMelee10</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion1">
+		<BuffID>810</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee1</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion2">
+		<BuffID>811</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee2</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion3">
+		<BuffID>812</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee3</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion4">
+		<BuffID>813</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee4</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion5">
+		<BuffID>814</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee5</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion6">
+		<BuffID>815</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee6</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion7">
+		<BuffID>816</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee7</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion8">
+		<BuffID>817</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee8</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion9">
+		<BuffID>818</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee9</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
+		</GfxType>
+	</BuffType>
+	<BuffType BuffName="PlagueBattalionMinion10">
+		<BuffID>819</BuffID>
+		<Attack>false</Attack>
+		<Duration>3000</Duration>
+		<MeleeOverride>PlagueBattalionMelee10</MeleeOverride>
+		<GfxType>
+			<AnimScale>1.5</AnimScale>
+			<AnimFile>SFX_1.swf</AnimFile>
+			<AnimClass>a_LeechAura</AnimClass>
 		</GfxType>
 	</BuffType>
 </PlayerBuffTypes>

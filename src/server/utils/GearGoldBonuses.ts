@@ -1,7 +1,7 @@
 import * as fs from 'fs';
-import * as os from 'os';
 import * as path from 'path';
-import { Config } from '../core/config';
+import { MAX_GEAR_TIER } from '../core/GameData';
+import { resolveClientXmlDir } from './ClientXmlDir';
 
 const gearGoldFindByKey = new Map<string, number>();
 let loaded = false;
@@ -35,7 +35,7 @@ function normalizeTier(value: unknown): number {
     if (!Number.isFinite(tier) || tier <= 0) {
         return 0;
     }
-    return tier >= 2 ? 2 : 1;
+    return Math.min(MAX_GEAR_TIER, Math.round(tier));
 }
 
 function tierFromRarity(rarity: string): number {
@@ -44,32 +44,11 @@ function tierFromRarity(rarity: string): number {
             return 1;
         case 'L':
             return 2;
+        case 'Y':
+            return 3;
         default:
             return 0;
     }
-}
-
-function resolveXmlDir(): string | null {
-    const envDir = process.env.DB_XML_DATA_DIR;
-    const candidates = [
-        envDir,
-        path.resolve(Config.DATA_DIR, '../client/content/xml'),
-        path.join(Config.DATA_DIR, 'xml'),
-        path.join(process.cwd(), 'src/client/content/xml'),
-        path.join(process.cwd(), 'xml'),
-        path.join(os.homedir(), 'Desktop', 'xml')
-    ].filter((value): value is string => Boolean(value));
-
-    for (const candidate of candidates) {
-        if (
-            fs.existsSync(path.join(candidate, 'GearTypes.xml')) &&
-            fs.existsSync(path.join(candidate, 'MagicTypes.xml'))
-        ) {
-            return candidate;
-        }
-    }
-
-    return null;
 }
 
 function loadGearGoldFind(): void {
@@ -78,7 +57,7 @@ function loadGearGoldFind(): void {
     }
     loaded = true;
 
-    const xmlDir = resolveXmlDir();
+    const xmlDir = resolveClientXmlDir(['GearTypes.xml', 'MagicTypes.xml']);
     if (!xmlDir) {
         console.warn('[GearGoldBonuses] GearTypes.xml/MagicTypes.xml not found; gear gold find is disabled.');
         return;

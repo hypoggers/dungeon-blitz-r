@@ -11,15 +11,20 @@ import { LevelHandler } from './LevelHandler';
 import { MissionHandler } from './MissionHandler';
 import { PetHandler } from './PetHandler';
 import { DialogueTranslationLoader } from '../data/DialogueTranslationLoader';
+import { LegendsInnDialogue } from '../core/LegendsInnDialogue';
 import { discordSocialBridge } from '../integrations/DiscordSocialBridge';
 import {
+    clampSocialLevel,
     ensureCharacterSocialState,
     FriendEntry,
+    getFriendListSanitizationSummary,
     getCharacterIgnoredEntries,
     isCharacterIgnoring,
+    MAX_FRIEND_ENTRIES,
     normalizeCharacterKey,
     PartyGroup,
-    PendingTeleport
+    PendingTeleport,
+    sanitizeSocialText
 } from '../core/SocialState';
 import { areClientsInSameLevelScope, getClientLevelScope } from '../core/LevelScope';
 
@@ -47,7 +52,9 @@ export interface DiscordPartyJoinResult {
         | 'party-not-found'
         | 'party-leader-mismatch'
         | 'party-locked'
-        | 'party-full';
+        | 'party-full'
+        | 'requester-in-dungeon'
+        | 'party-in-dungeon';
     message: string;
     partyId: number | null;
 }
@@ -55,7 +62,35 @@ export interface DiscordPartyJoinResult {
 export class SocialHandler {
     private static readonly MAX_PARTY_SIZE = 4;
     private static readonly FRIEND_REQUEST_PROMPT_TTL_MS = 5 * 60_000;
+    private static readonly TELEPORT_COMMAND_PREFIXES = ['/teleport:', 'teleport:'];
+    private static readonly MAINTENANCE_COMMAND_PREFIX = '/maintenance:';
+    private static readonly MAINTENANCE_COMMAND_EMAILS = new Set([
+        '1@gmail.com',
+        'ardaarican3399@gmail.com',
+        'ardaarican3999@gmail.com',
+        'neodevils_contact@icloud.com'
+    ]);
+    private static readonly MAX_MAINTENANCE_WARNING_SECONDS = 86_400;
+    private static readonly TELEPORT_COST_GOLD = 20_000;
+    private static readonly DREAD_TELEPORT_COST_GOLD = 40_000;
+    private static readonly SOCIAL_LOG_THROTTLE_MS = 30_000;
+    private static readonly TELEPORT_DESTINATIONS: Map<
+        string,
+        { level: string; dreadLevel: string; displayName: string }
+    > = new Map([
+        ['wolfs-end', { level: 'NewbieRoad', dreadLevel: 'NewbieRoadHard', displayName: "Wolf's End" }],
+        ['black-rose-mire', { level: 'SwampRoadNorth', dreadLevel: 'SwampRoadNorthHard', displayName: 'Black Rose Mire' }],
+        ['castle-hocke', { level: 'Castle', dreadLevel: 'CastleHard', displayName: 'Castle Hocke' }],
+        ['emerald-glades', { level: 'EmeraldGlades', dreadLevel: 'EmeraldGladesHard', displayName: 'Emerald Glades' }],
+        ['stormshard-mountain', { level: 'OldMineMountain', dreadLevel: 'OldMineMountainHard', displayName: 'Stormshard Mountain' }],
+        ['cemetry-hill', { level: 'CemeteryHill', dreadLevel: 'CemeteryHillHard', displayName: 'Cemetery Hill' }],
+        ['cemetery-hill', { level: 'CemeteryHill', dreadLevel: 'CemeteryHillHard', displayName: 'Cemetery Hill' }],
+        ['felbridge', { level: 'BridgeTown', dreadLevel: 'BridgeTownHard', displayName: 'Felbridge' }],
+        ['shazari-desert', { level: 'ShazariDesert', dreadLevel: 'ShazariDesertHard', displayName: 'Shazari Desert' }],
+        ['valhaven', { level: 'JadeCity', dreadLevel: 'JadeCityHard', displayName: 'Valhaven' }]
+    ]);
     private static readonly pendingFriendRequestPrompts: Map<number, PendingFriendRequestPrompt> = new Map();
+    private static readonly lastSocialWarningByCharacter: Map<string, number> = new Map();
 
     private static normalizeName(value: unknown): string {
         return normalizeCharacterKey(value);
@@ -96,12 +131,6 @@ export class SocialHandler {
         }
     }
 
-    private static appendBuffer(bb: BitBuffer, buffer: Buffer): void {
-        for (const byte of buffer) {
-            bb.writeMethod11(byte, 8);
-        }
-    }
-
     private static buildEmptyPartyPayload(): Buffer {
         const bb = new BitBuffer(false);
         bb.writeMethod15(false);
@@ -139,6 +168,141 @@ export class SocialHandler {
         const bb = new BitBuffer(false);
         bb.writeMethod13(text);
         target.sendBitBuffer(0x44, bb);
+    }
+
+    private static sendGoldLoss(client: Client, amount: number): void {
+        const bb = new BitBuffer(false);
+        bb.writeMethod4(amount);
+        client.sendBitBuffer(0xB4, bb);
+    }
+
+    private static handleMaintenanceCommand(client: Client, message: string): boolean {
+        const normalized = String(message ?? '').trim();
+        if (!normalized.toLowerCase().startsWith(SocialHandler.MAINTENANCE_COMMAND_PREFIX)) {
+            return false;
+        }
+
+        const email = String(client.account?.email ?? '').trim().toLowerCase();
+        if (!SocialHandler.MAINTENANCE_COMMAND_EMAILS.has(email)) {
+            SocialHandler.sendChatStatus(client, 'You are not authorized to use the maintenance command.');
+            return true;
+        }
+
+        const rawSeconds = normalized.slice(SocialHandler.MAINTENANCE_COMMAND_PREFIX.length).trim();
+        if (!/^\d+$/.test(rawSeconds)) {
+            SocialHandler.sendChatStatus(client, 'Usage: /maintenance:<seconds>');
+            return true;
+        }
+
+        const seconds = Number(rawSeconds);
+        if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > SocialHandler.MAX_MAINTENANCE_WARNING_SECONDS) {
+            SocialHandler.sendChatStatus(
+                client,
+                `Maintenance seconds must be between 1 and ${SocialHandler.MAX_MAINTENANCE_WARNING_SECONDS}.`
+            );
+            return true;
+        }
+
+        const warning = new BitBuffer(false);
+        warning.writeMethod4(seconds);
+        const payload = warning.toBuffer();
+        for (const session of GlobalState.sessionsByToken.values()) {
+            session.send(0x101, payload);
+        }
+        return true;
+    }
+
+    private static parseTeleportCommand(message: string): { slug: string; dread: boolean } | null {
+        const normalized = String(message ?? '').trim().toLowerCase();
+        const prefix = SocialHandler.TELEPORT_COMMAND_PREFIXES.find((entry) => normalized.startsWith(entry));
+        if (!prefix) {
+            return null;
+        }
+
+        const rawSlug = normalized.slice(prefix.length).trim();
+        if (!rawSlug) {
+            return { slug: '', dread: false };
+        }
+
+        const dread = rawSlug.startsWith('dread-');
+        const slug = dread ? rawSlug.slice('dread-'.length) : rawSlug;
+        return { slug, dread };
+    }
+
+    private static buildLevelTeleport(client: Client, targetLevelName: string): PendingTeleport | null {
+        const targetLevel = LevelConfig.normalizeLevelName(targetLevelName);
+        if (!targetLevel || !LevelConfig.has(targetLevel)) {
+            return null;
+        }
+
+        const spawn = LevelConfig.getSpawnCoordinates(client.character, targetLevel, targetLevel);
+        return {
+            targetLevel,
+            x: spawn.x,
+            y: spawn.y,
+            hasCoord: spawn.hasCoord
+        };
+    }
+
+    private static async handleTeleportCommand(client: Client, message: string): Promise<boolean> {
+        const parsed = SocialHandler.parseTeleportCommand(message);
+        if (!parsed) {
+            return false;
+        }
+
+        if (!client.character || !client.token) {
+            return true;
+        }
+
+        const destination = SocialHandler.TELEPORT_DESTINATIONS.get(parsed.slug);
+        if (!destination) {
+            SocialHandler.sendChatStatus(client, 'Unknown teleport destination.');
+            return true;
+        }
+
+        const targetLevel = parsed.dread ? destination.dreadLevel : destination.level;
+        const teleport = SocialHandler.buildLevelTeleport(client, targetLevel);
+        if (!teleport) {
+            SocialHandler.sendChatStatus(client, 'Teleport target is unavailable.');
+            return true;
+        }
+
+        const cost = parsed.dread ? SocialHandler.DREAD_TELEPORT_COST_GOLD : SocialHandler.TELEPORT_COST_GOLD;
+        const currentGold = Math.max(0, Math.floor(Number(client.character.gold ?? 0)));
+        const destinationName = `${parsed.dread ? 'Dread ' : ''}${destination.displayName}`;
+        if (!LevelHandler.isLevelUnlockedForFastTravel(client, teleport.targetLevel)) {
+            SocialHandler.sendChatStatus(client, `You haven't unlocked ${destinationName} yet.`);
+            return true;
+        }
+
+        if (currentGold < cost) {
+            SocialHandler.sendChatStatus(
+                client,
+                `You need ${cost.toLocaleString('en-US')} gold to teleport to ${destinationName}.`
+            );
+            return true;
+        }
+
+        client.character.gold = currentGold - cost;
+        if (client.userId) {
+            await db.saveCharacters(client.userId, client.characters);
+        }
+
+        SocialHandler.sendGoldLoss(client, cost);
+
+        client.craftTownHostCharacter = null;
+        GlobalState.pendingTeleports.set(client.token, teleport);
+        client.lastDoorId = 0;
+        client.lastDoorTargetLevel = teleport.targetLevel;
+        client.armPendingTransferGrace();
+        PetHandler.armMountTravelProtection(client, 5000, false);
+
+        const bb = new BitBuffer(false);
+        bb.writeMethod4(0);
+        bb.writeMethod13(teleport.targetLevel);
+        client.sendBitBuffer(0x2e, bb);
+
+        return true;
     }
 
     private static sendQueryMessageQuestion(target: Client, token: number, name: string, message: string): void {
@@ -213,6 +377,16 @@ export class SocialHandler {
         return Array.isArray(character?.friends) ? (character.friends as FriendEntry[]) : [];
     }
 
+    private static getSerializableFriendEntries(character: Character | null | undefined): FriendEntry[] {
+        return SocialHandler.getFriendEntries(character)
+            .map((entry) => ({
+                name: sanitizeSocialText(entry?.name),
+                isRequest: Boolean(entry?.isRequest)
+            }))
+            .filter((entry) => Boolean(entry.name))
+            .slice(0, MAX_FRIEND_ENTRIES);
+    }
+
     private static findFriendIndex(character: Character | null | undefined, friendName: string): number {
         const friendKey = SocialHandler.normalizeName(friendName);
         return SocialHandler.getFriendEntries(character).findIndex((entry) =>
@@ -234,20 +408,28 @@ export class SocialHandler {
             return false;
         }
 
+        const normalizedEntry = {
+            name: sanitizeSocialText(entry.name),
+            isRequest: Boolean(entry.isRequest)
+        };
+        if (!normalizedEntry.name) {
+            return false;
+        }
+
         const friends = SocialHandler.getFriendEntries(character);
-        const index = SocialHandler.findFriendIndex(character, entry.name);
+        const index = SocialHandler.findFriendIndex(character, normalizedEntry.name);
         if (index >= 0) {
             const current = friends[index];
-            if (current.name === entry.name && current.isRequest === entry.isRequest) {
+            if (current.name === normalizedEntry.name && current.isRequest === normalizedEntry.isRequest) {
                 return false;
             }
 
-            friends[index] = { ...entry };
+            friends[index] = normalizedEntry;
             character.friends = friends;
             return true;
         }
 
-        character.friends = [...friends, { ...entry }];
+        character.friends = [...friends, normalizedEntry];
         return true;
     }
 
@@ -269,24 +451,28 @@ export class SocialHandler {
         return removed ?? null;
     }
 
-    private static buildFriendStatusPayload(friendName: string, isRequest: boolean, session: Client | null): Buffer {
-        const bb = new BitBuffer(false);
-        bb.writeMethod13(friendName);
+    private static writeFriendStatus(bb: BitBuffer, friendName: string, isRequest: boolean, session: Client | null): void {
+        const normalizedFriendName = sanitizeSocialText(friendName, 'Unknown');
+        bb.writeMethod13(normalizedFriendName);
         bb.writeMethod15(isRequest);
 
         const online = Boolean(session?.character);
         bb.writeMethod15(online);
         if (online && session?.character) {
-            const displayName = session.character.name;
-            const hasCustomCharacterName = displayName !== friendName;
+            const displayName = sanitizeSocialText(session.character.name, normalizedFriendName);
+            const hasCustomCharacterName = displayName !== normalizedFriendName;
             bb.writeMethod15(hasCustomCharacterName);
             if (hasCustomCharacterName) {
                 bb.writeMethod13(displayName);
             }
             bb.writeMethod6(SocialHandler.classIdFromName(String(session.character.class ?? 'Paladin')), 2);
-            bb.writeMethod6(Math.max(1, Math.min(Number(session.character.level ?? 1), 63)), 6);
+            bb.writeMethod6(clampSocialLevel(session.character.level), 6);
         }
+    }
 
+    private static buildFriendStatusPayload(friendName: string, isRequest: boolean, session: Client | null): Buffer {
+        const bb = new BitBuffer(false);
+        SocialHandler.writeFriendStatus(bb, friendName, isRequest, session);
         return bb.toBuffer();
     }
 
@@ -309,8 +495,29 @@ export class SocialHandler {
         }
 
         const bb = new BitBuffer(false);
-        bb.writeMethod13(friendName);
+        bb.writeMethod13(sanitizeSocialText(friendName, 'Unknown'));
         target.sendBitBuffer(0x93, bb);
+    }
+
+    private static logFriendListSanitization(character: Character, source: string): void {
+        const summary = getFriendListSanitizationSummary(character.friends);
+        if (summary.droppedCount <= 0 && !summary.truncated) {
+            return;
+        }
+
+        const name = sanitizeSocialText(character.name, 'unknown');
+        const key = `${SocialHandler.normalizeName(name)}:${source}`;
+        const now = Date.now();
+        const last = SocialHandler.lastSocialWarningByCharacter.get(key) ?? 0;
+        if (now - last < SocialHandler.SOCIAL_LOG_THROTTLE_MS) {
+            return;
+        }
+
+        SocialHandler.lastSocialWarningByCharacter.set(key, now);
+        console.warn(
+            `[SocialHandler] Sanitized ${source} friend list for ${name}: raw=${summary.rawCount}, ` +
+            `sent=${summary.normalizedCount}, dropped=${summary.droppedCount}, truncated=${summary.truncated}`
+        );
     }
 
     private static sendFullFriendList(client: Client): void {
@@ -318,18 +525,17 @@ export class SocialHandler {
             return;
         }
 
+        SocialHandler.logFriendListSanitization(client.character, 'request');
         const bb = new BitBuffer(false);
-        const friends = SocialHandler.getFriendEntries(client.character);
+        const friends = SocialHandler.getSerializableFriendEntries(client.character);
         bb.writeMethod4(friends.length);
 
         for (const friend of friends) {
-            SocialHandler.appendBuffer(
+            SocialHandler.writeFriendStatus(
                 bb,
-                SocialHandler.buildFriendStatusPayload(
-                    friend.name,
-                    friend.isRequest,
-                    SocialHandler.getOnlineSession(friend.name)
-                )
+                friend.name,
+                friend.isRequest,
+                SocialHandler.getOnlineSession(friend.name)
             );
         }
 
@@ -650,6 +856,21 @@ export class SocialHandler {
     }
 
     private static translateRoomThought(client: Client, entityId: number, text: string): string {
+        // Legends' Inn borrows nine dungeons whole, and a borrowed dungeon brings
+        // its own dialogue with it: the room scripts still fire the lines the
+        // goblins and raptors that used to stand here were written to shout. The
+        // event is kept - the level still decides *when* a hostile speaks - and
+        // only the words are swapped, for Telahair's story.
+        //
+        // Returned untranslated, on purpose. These lines are authored English and
+        // are meant to be read as written, and running them through the translator
+        // would do worse than nothing: with no entry to match, an enemy line falls
+        // through to `fallbackToGeneric`, which answers a story beat with a canned
+        // taunt.
+        const legendsInnLine = LegendsInnDialogue.resolveLine(client, entityId, text);
+        if (legendsInnLine) {
+            return legendsInnLine;
+        }
         return DialogueTranslationLoader.translateText(
             text,
             SocialHandler.getDialogueLanguage(client.character),
@@ -682,6 +903,26 @@ export class SocialHandler {
         return Boolean(party && SocialHandler.normalizeName(party.group.leader) === SocialHandler.normalizeName(name));
     }
 
+    /**
+     * A dungeon run is keyed off the party that started it — level scope, shared
+     * progress and the completion state all hang off that party id. Letting the
+     * roster change mid-run would strand that state, so membership is frozen while
+     * anyone involved is inside a dungeon. Walking back out is still allowed; only
+     * the party bond is locked.
+     */
+    private static isInsideDungeon(client: Client | null | undefined): boolean {
+        return Boolean(client) && LevelConfig.isDungeonLevel(client!.currentLevel);
+    }
+
+    private static isCharacterInsideDungeon(name: string): boolean {
+        return SocialHandler.isInsideDungeon(SocialHandler.getOnlineSession(name));
+    }
+
+    /** True when any online member of the party is currently inside a dungeon. */
+    private static isPartyInsideDungeon(group: PartyGroup): boolean {
+        return group.members.some((member) => SocialHandler.isCharacterInsideDungeon(member));
+    }
+
     private static createParty(leaderName: string): PartyGroup {
         let partyId = 0;
         do {
@@ -698,6 +939,7 @@ export class SocialHandler {
 
         GlobalState.partyGroups.set(partyId, group);
         GlobalState.partyByMember.set(SocialHandler.normalizeName(displayName), partyId);
+        GlobalState.refreshSessionIndexesByCharacterName(displayName);
         return group;
     }
 
@@ -714,6 +956,7 @@ export class SocialHandler {
 
         GlobalState.partyGroups.set(group.id, group);
         GlobalState.partyByMember.set(memberKey, group.id);
+        GlobalState.refreshSessionIndexesByCharacterName(displayName);
         return group;
     }
 
@@ -726,6 +969,7 @@ export class SocialHandler {
         const memberKey = SocialHandler.normalizeName(memberName);
         party.group.members = party.group.members.filter((entry) => SocialHandler.normalizeName(entry) !== memberKey);
         GlobalState.partyByMember.delete(memberKey);
+        GlobalState.refreshSessionIndexesByCharacterName(memberName);
 
         if (SocialHandler.normalizeName(party.group.leader) === memberKey) {
             party.group.leader = party.group.members[0] ?? '';
@@ -762,6 +1006,7 @@ export class SocialHandler {
         GlobalState.partyGroups.delete(partyId);
         for (const member of group.members) {
             GlobalState.partyByMember.delete(SocialHandler.normalizeName(member));
+            GlobalState.refreshSessionIndexesByCharacterName(member);
         }
 
         return [...group.members];
@@ -872,20 +1117,22 @@ export class SocialHandler {
         let y = 0;
         let hasCoord = false;
 
+        // Where the target was last standing, never where they are this instant: arriving on
+        // a friend who is mid-jump would drop the traveller in from that height.
         const entity = target.entities.get(target.clientEntID);
-        if (entity && Number.isFinite(entity.x) && Number.isFinite(entity.y)) {
-            x = Math.round(Number(entity.x));
-            y = Math.round(Number(entity.y));
+        const grounded = LevelHandler.resolveGroundedAnchorPosition(entity, targetLevel);
+        if (grounded) {
+            x = grounded.x;
+            y = grounded.y;
             hasCoord = true;
         } else {
-            const savedLevel = target.character?.CurrentLevel;
-            if (
-                LevelConfig.normalizeLevelName(savedLevel?.name) === targetLevel &&
-                Number.isFinite(savedLevel?.x) &&
-                Number.isFinite(savedLevel?.y)
-            ) {
-                x = Math.round(Number(savedLevel.x));
-                y = Math.round(Number(savedLevel.y));
+            // The saved record used to be read here. It is dead-reckoned, so it can be
+            // anywhere relative to real floor -- see core/GroundedPosition.ts -- and arriving
+            // on a friend is exactly the moment a bad coordinate is most visible.
+            const confirmed = LevelConfig.getConfirmedSpawnForLevel(target.character, targetLevel);
+            if (confirmed) {
+                x = confirmed.x;
+                y = confirmed.y;
                 hasCoord = true;
             } else {
                 const spawn = LevelConfig.getSpawnCoordinates(target.character, targetLevel, targetLevel);
@@ -962,6 +1209,15 @@ export class SocialHandler {
         }
 
         const requesterDisplayName = requester.character.name;
+        if (SocialHandler.isInsideDungeon(requester)) {
+            return {
+                ok: false,
+                reason: 'requester-in-dungeon',
+                message: `${requesterDisplayName} cannot join a party while inside a dungeon.`,
+                partyId: null
+            };
+        }
+
         const requesterParty = SocialHandler.getPartyForName(requesterDisplayName);
         if (requesterParty && requesterParty.partyId === targetPartyId) {
             return {
@@ -1019,6 +1275,15 @@ export class SocialHandler {
             };
         }
 
+        if (SocialHandler.isPartyInsideDungeon(group)) {
+            return {
+                ok: false,
+                reason: 'party-in-dungeon',
+                message: `${group.leader}'s party is in the middle of a dungeon run.`,
+                partyId: targetPartyId
+            };
+        }
+
         SocialHandler.addPartyMember(group, requesterDisplayName);
         SocialHandler.broadcastPartyUpdateById(targetPartyId);
 
@@ -1038,6 +1303,14 @@ export class SocialHandler {
         const br = new BitReader(data);
         br.readMethod9();
         const message = String(br.readMethod13() ?? '').trim();
+
+        if (SocialHandler.handleMaintenanceCommand(client, message)) {
+            return;
+        }
+
+        if (await SocialHandler.handleTeleportCommand(client, message)) {
+            return;
+        }
 
         if (client.character) {
             const match = /^\/lang:\s*(tr|en)\s*$/i.exec(message);
@@ -1344,6 +1617,11 @@ export class SocialHandler {
             return;
         }
 
+        if (SocialHandler.isInsideDungeon(client)) {
+            SocialHandler.sendChatStatus(client, 'You cannot form a party while inside a dungeon. Leave the dungeon first.');
+            return;
+        }
+
         const invitee = SocialHandler.getOnlineSession(inviteeName);
         if (!invitee?.character) {
             SocialHandler.sendChatStatus(client, `Player ${inviteeName} not found`);
@@ -1357,6 +1635,11 @@ export class SocialHandler {
 
         if (SocialHandler.getPartyForName(invitee.character.name)) {
             SocialHandler.sendChatStatus(client, `${invitee.character.name} is already in a party.`);
+            return;
+        }
+
+        if (SocialHandler.isInsideDungeon(invitee)) {
+            SocialHandler.sendChatStatus(client, `${invitee.character.name} is inside a dungeon and cannot join a party.`);
             return;
         }
 
@@ -1408,6 +1691,18 @@ export class SocialHandler {
             return;
         }
 
+        if (SocialHandler.isInsideDungeon(client)) {
+            SocialHandler.sendChatStatus(client, 'You cannot join a party while inside a dungeon. Leave the dungeon first.');
+            SocialHandler.sendChatStatus(inviter, `${inviteeName} is inside a dungeon and cannot join a party.`);
+            return;
+        }
+
+        if (SocialHandler.isInsideDungeon(inviter)) {
+            SocialHandler.sendChatStatus(client, `${inviter.character.name} is inside a dungeon and cannot form a party.`);
+            SocialHandler.sendChatStatus(inviter, 'You cannot form a party while inside a dungeon. Leave the dungeon first.');
+            return;
+        }
+
         const inviterExistingParty = SocialHandler.getPartyForName(inviter.character.name);
         const group = inviterExistingParty?.group ?? SocialHandler.createParty(inviter.character.name);
         const partyId = inviterExistingParty?.partyId ?? group.id;
@@ -1446,6 +1741,11 @@ export class SocialHandler {
             return;
         }
 
+        if (SocialHandler.isInsideDungeon(client)) {
+            SocialHandler.sendChatStatus(client, 'You cannot join a party while inside a dungeon. Leave the dungeon first.');
+            return;
+        }
+
         const targetSession = SocialHandler.getOnlineSession(targetName);
         if (!targetSession?.character) {
             SocialHandler.sendChatStatus(client, `Player ${targetName} not found`);
@@ -1460,6 +1760,11 @@ export class SocialHandler {
 
         if (targetParty.group.locked) {
             SocialHandler.sendChatStatus(client, `${targetSession.character.name}'s party is locked.`);
+            return;
+        }
+
+        if (SocialHandler.isPartyInsideDungeon(targetParty.group)) {
+            SocialHandler.sendChatStatus(client, `${targetSession.character.name}'s party is in the middle of a dungeon run.`);
             return;
         }
 
@@ -1481,6 +1786,11 @@ export class SocialHandler {
         const party = SocialHandler.getPartyForName(client.character.name);
         if (!party) {
             SocialHandler.sendChatStatus(client, 'You are not in a party.');
+            return;
+        }
+
+        if (SocialHandler.isInsideDungeon(client)) {
+            SocialHandler.sendChatStatus(client, 'You cannot leave your party while inside a dungeon. You may leave the dungeon instead.');
             return;
         }
 
@@ -1551,6 +1861,16 @@ export class SocialHandler {
             return;
         }
 
+        if (SocialHandler.isInsideDungeon(client)) {
+            SocialHandler.sendChatStatus(client, 'You cannot remove party members while inside a dungeon.');
+            return;
+        }
+
+        if (SocialHandler.isCharacterInsideDungeon(targetMember)) {
+            SocialHandler.sendChatStatus(client, `${targetMember} is inside a dungeon and cannot be removed from the party.`);
+            return;
+        }
+
         const oldMembers = [...party.group.members];
         const targetSession = SocialHandler.getOnlineSession(targetMember);
         SocialHandler.removePartyMember(targetMember);
@@ -1613,6 +1933,11 @@ export class SocialHandler {
         );
         if (!targetMember) {
             SocialHandler.sendChatStatus(client, `${targetName} is not in your party.`);
+            return;
+        }
+
+        if (SocialHandler.isPartyInsideDungeon(party.group)) {
+            SocialHandler.sendChatStatus(client, 'The party leader cannot be changed during a dungeon run.');
             return;
         }
 
@@ -1817,27 +2142,52 @@ export class SocialHandler {
         const br = new BitReader(data);
         const entityId = br.readMethod4();
         const text = br.readMethod13();
+        LevelHandler.maybeStartGoblinRiverBossIntroLock(client, entityId, text);
+        LevelHandler.maybeFinishTutorialDungeonAfterAnnaCutscene(client, text);
+        LevelHandler.maybeFinishSDMission4AfterBossDialogue(client, text);
+        const delivery = LevelHandler.getDungeonCutsceneRoomThoughtDelivery(client, entityId, text);
+        if (delivery === 'suppress') {
+            return;
+        }
         const payload = SocialHandler.buildRoomThoughtPayload(
             entityId,
             SocialHandler.translateRoomThought(client, entityId, text)
         );
-        LevelHandler.maybeStartGoblinRiverBossIntroLock(client, entityId, text);
         MissionHandler.noteDungeonSkitActivity(client);
+
+        if (delivery === 'local') {
+            client.send(0x76, payload);
+            return;
+        }
 
         SocialHandler.relayToLevel(client, 0x76, payload, true);
     }
 
     static handleStartSkit(client: Client, data: Buffer): void {
         const br = new BitReader(data);
-        const entityId = br.readMethod9();
-        br.readMethod15();
+        const sourceEntityId = br.readMethod9();
+        const playerThought = br.readMethod15();
         const text = br.readMethod26();
+        const entityId = playerThought && client.clientEntID > 0
+            ? client.clientEntID
+            : sourceEntityId;
+        LevelHandler.maybeStartGoblinRiverBossIntroLock(client, sourceEntityId, text);
+        LevelHandler.maybeFinishTutorialDungeonAfterAnnaCutscene(client, text);
+        LevelHandler.maybeFinishSDMission4AfterBossDialogue(client, text);
+        const delivery = LevelHandler.getDungeonCutsceneRoomThoughtDelivery(client, entityId, text);
+        if (delivery === 'suppress') {
+            return;
+        }
         const payload = SocialHandler.buildRoomThoughtPayload(
             entityId,
             SocialHandler.translateRoomThought(client, entityId, text)
         );
-        LevelHandler.maybeStartGoblinRiverBossIntroLock(client, entityId, text);
         MissionHandler.noteDungeonSkitActivity(client);
+
+        if (delivery === 'local') {
+            client.send(0x76, payload);
+            return;
+        }
 
         SocialHandler.relayToLevel(client, 0x76, payload, true);
     }
@@ -1846,6 +2196,10 @@ export class SocialHandler {
         const br = new BitReader(data);
         br.readMethod4();
         br.readMethod13();
+
+        if (LevelHandler.relaySharedDungeonCutscenePresentationPacket(client, 0x7e, data)) {
+            return;
+        }
 
         SocialHandler.relayToLevel(client, 0x7e, data);
     }
@@ -1871,6 +2225,10 @@ export class SocialHandler {
     static handleEmoteEnd(client: Client, data: Buffer): void {
         const br = new BitReader(data);
         br.readMethod4();
+
+        if (LevelHandler.relaySharedDungeonCutscenePresentationPacket(client, 0x7f, data)) {
+            return;
+        }
 
         SocialHandler.relayToLevel(client, 0x7f, data);
     }

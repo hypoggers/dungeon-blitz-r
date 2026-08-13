@@ -279,10 +279,13 @@ const EXACT_PHRASES = new Map(Object.entries({
     'Candy Corn': 'Cadilar Sekeri',
     '+8% Gear Find': '+%8 ekipman bulma sansi',
     '+8% Gear Finding': '+%8 ekipman bulma sansi',
-    '+8% Gold Finding;+8% Gear Find;+4% Critical Chance': '+%8 altin bulma sansi;+%8 ekipman bulma sansi;+%4 kritik sans',
+    '+8% Gold Finding;+8% Gear Find;+4% Critical Chance': '+%8 altin bulma sansi;+%8 ekipman bulma sansi;+%0.8 kritik sans',
+    '+8% Gold Finding;+8% Gear Find;+0.8% Critical Chance': '+%8 altin bulma sansi;+%8 ekipman bulma sansi;+%0.8 kritik sans',
     '+8% Gold Finding;+8% Gear Find': '+%8 altin bulma sansi;+%8 ekipman bulma sansi',
-    '+8% Gold Finding;+4% Critical Chance': '+%8 altin bulma sansi;+%4 kritik sans',
-    '+8% Gear Find;+4% Critical Chance': '+%8 ekipman bulma sansi;+%4 kritik sans'
+    '+8% Gold Finding;+4% Critical Chance': '+%8 altin bulma sansi;+%0.8 kritik sans',
+    '+8% Gold Finding;+0.8% Critical Chance': '+%8 altin bulma sansi;+%0.8 kritik sans',
+    '+8% Gear Find;+4% Critical Chance': '+%8 ekipman bulma sansi;+%0.8 kritik sans',
+    '+8% Gear Find;+0.8% Critical Chance': '+%8 ekipman bulma sansi;+%0.8 kritik sans'
 }));
 
 const PROPER_PHRASES = new Map(Object.entries({
@@ -1677,7 +1680,6 @@ function localizePowerParagraph(source) {
     }
 
     const normalized = value
-        .replace(/\bAoE\b/g, 'AoE')
         .replace(/(%|#\w+#)and\s+(?=(?:Increased|Improved|Adds?|Grants?|Gain|Applies|Inflicts|Deals?|Staggers?|Stuns?))/gi, '$1 and ')
         .replace(/\s+/g, ' ')
         .trim();
@@ -1909,8 +1911,6 @@ function localizePowerSentence(source) {
         'Damages, Cripples and Binds a single target.': 'Tek hedefe hasar verir; Sakatlama ve Baglama uygular.',
         'Damages, Cripples, Poisons and Binds a single target.': 'Tek hedefe hasar verir; Sakatlama, Zehir ve Baglama uygular.',
         'Release Chaotic energy, Binding and reducing the Attack of nearby foes': 'Kaotik enerji salar; yakindaki dusmanlari baglar ve saldirilarini azaltir',
-        'Release Chaotic energy, Binding and reducing the Attack of nearby foes. Grants an Expertise buff': 'Kaotik enerji salar; yakindaki dusmanlari baglar ve saldirilarini azaltir. Uzmanlik guclendirmesi verir.',
-        'Release Chaotic energy, Binding, Poisoning and reducing the Attack of nearby foes. Grants an Expertise buff': 'Kaotik enerji salar; yakindaki dusmanlari baglar, zehirler ve saldirilarini azaltir. Uzmanlik guclendirmesi verir.',
         'Strike your opponent with a powerful blow, dealing increased damage to Bound targets': 'Rakibe guclu bir darbe indirir; Bagli hedeflere daha fazla hasar verir',
         'Vampiric AoE attack.': 'Vampirik alan saldirisi.',
         'Vampiric AoE attack that deals increased damage to Bound targets': 'Bagli hedeflere daha fazla hasar veren vampirik alan saldirisi',

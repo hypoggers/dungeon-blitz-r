@@ -3,9 +3,14 @@ import { BitBuffer } from '../network/protocol/bitBuffer';
 import { PacketRouter } from '../network/packetRouter';
 import { UserAccount, Character } from '../database/Database';
 import { JsonAdapter } from '../database/JsonAdapter';
-import { DebugLogger } from './Debug';
 import type { DungeonRunStats } from './DungeonRunStats';
+import { clearStoredDungeonSnapshot } from './DungeonSnapshot';
 import { LevelConfig } from './LevelConfig';
+import { MovementAuthority, MovementAuthorityState } from './MovementAuthority';
+import { CastRateAuthority, CastRateState } from './CastRateAuthority';
+import { performance } from 'perf_hooks';
+import { getActiveMovementPacketKey, mergeActiveMovementPackets } from '../network/movementPacket';
+import { RegionPositionPersistence } from './RegionPositionPersistence';
 
 const db = new JsonAdapter();
 const SOCKET_POLICY_REQUEST = '<policy-file-request/>';
@@ -23,6 +28,27 @@ export interface PendingLootDrop {
     tier?: number;
     material?: number;
     dye?: number;
+    /**
+     * A consumable the `material` above is only the carrier for. The loot-drop
+     * packet has no consumable slot, so the Legends' Inn chest drops a catalyst as
+     * a rarity-matched material and swaps it back on pickup.
+     */
+    consumable?: number;
+    __lootDropMetadata?: {
+        lootdropId: number;
+        lootDropNonce: string;
+        sourceEnemyLootDropNonce: string;
+        sourceEnemyCanonicalId: number;
+        ownerToken: number;
+        partyId: number;
+        sharedScope: string;
+        amount: number;
+        type: string;
+        reason: string;
+        caller: string;
+        collected: boolean;
+        collectedBy: number;
+    };
 }
 
 export interface KeepTutorialState {
@@ -55,6 +81,14 @@ interface SessionCleanupSnapshot {
     characterName: string;
     normalizedCharName: string;
 }
+
+type QueuedPacket = {
+    packetId: number;
+    data: Buffer;
+    enqueuedAt: number;
+    depthAtEnqueue: number;
+    coalesceKey: string | null;
+};
 
 export function createKeepTutorialState(): KeepTutorialState {
     return {
@@ -119,6 +153,8 @@ export class Client {
     private static readonly DEFAULT_DEFERRED_CHARACTER_SAVE_MS = 150;
     private static readonly COMBAT_REWARD_DEFERRED_CHARACTER_SAVE_MS = 2500;
     private static readonly PENDING_LOOT_DEFERRED_CHARACTER_SAVE_MS = 750;
+    private static readonly MAX_BUFFERED_PACKET_BYTES = 1024 * 1024;
+    private static readonly MAX_QUEUED_PACKETS = 2048;
     private static readonly QUIET_SOCKET_ERROR_CODES = new Set([
         'ECONNABORTED',
         'ECONNRESET',
@@ -128,7 +164,13 @@ export class Client {
     public socket: net.Socket;
     public router: PacketRouter;
     private buffer: Buffer;
-    private packetQueue: Promise<void>;
+    private packetQueue: QueuedPacket[];
+    private queuedMovementByKey: Map<string, QueuedPacket>;
+    private packetQueueDrainActive: boolean;
+    private packetQueueEnqueued: number;
+    private packetQueueProcessed: number;
+    private packetQueueCoalesced: number;
+    private packetQueueMaxDepth: number;
     private outboundUncorkScheduled: boolean;
     private rawBytesIn: number;
     private rawBytesOut: number;
@@ -166,6 +208,9 @@ export class Client {
     public syncQuestProgress: number | undefined;
     public pendingTransferUntil: number = 0;
     public mountTransferGraceUntil: number = 0;
+    public roomTransitionGraceUntil: number = 0;
+    public movementAuthority: MovementAuthorityState = MovementAuthority.createState();
+    public castRate: CastRateState = CastRateAuthority.createState();
     public startedRoomEvents: Set<string> = new Set();
     public knownEntityIds: Set<number> = new Set();
     public entityIdAliases: Map<number, number> = new Map();
@@ -176,12 +221,22 @@ export class Client {
     public dungeonRun: DungeonRunStats | null = null;
     public pendingMissionTurnIns: Set<number> = new Set();
     public authoritativeMaxHp: number = 100;
+    /**
+     * Defense, as the client reports it on packet 0xFC. Zero until the patched client sends
+     * it -- a browser can serve a cached SWF older than the server, so nothing may assume it
+     * is populated.
+     */
+    public authoritativeArmorClass: number = 0;
+    /** Last mana the client reported over packet 0xCB. Diagnostic only -- never trusted. */
+    public lastReportedMana: number = 0;
     public authoritativeCurrentHp: number = 100;
     public combatStatsDirty: boolean = false;
     public allowDirtyCombatStatsRegen: boolean = false;
     public lastCombatStatsRefreshRequestAt: number = 0;
     public lastCombatStatsSyncedAt: number = 0;
     public pendingRespawnRequest: { usePotion: boolean; requestedAt: number } | null = null;
+    public pendingRespawnTimer: NodeJS.Timeout | null = null;
+    public respawnPotionCharged: boolean = false;
     public lastCombatActivityAt: number = 0;
     public lastCombatRegenTickAt: number = 0;
     public enemyDeathRegenArmed: boolean = false;
@@ -192,24 +247,22 @@ export class Client {
     public keepTutorialState: KeepTutorialState | null = null;
     public goblinRiverBossIntroLockUntil: number = 0;
     public goblinRiverBossIntroUnlockTimer: NodeJS.Timeout | null = null;
-    public forcedDungeonCompletionScope: string = "";
-    public finalizingDungeonCompletionScope: string = "";
-    public completedDungeonCompletionScope: string = "";
-    public completedDungeonCompletionSentAt: number = 0;
     public pendingDungeonCompletionScope: string = "";
     public pendingDungeonCompletionRequestedAt: number = 0;
     public pendingDungeonCompletionLastSkitAt: number = 0;
     public pendingDungeonCompletionNotBeforeAt: number = 0;
     public pendingDungeonCompletionSettleMs: number = 0;
     public pendingDungeonCompletionPayload: Buffer | null = null;
-    public pendingDungeonCompletionForceSharedScope: string = "";
     public pendingDungeonCompletionTimer: NodeJS.Timeout | null = null;
     public pendingDungeonCompletionFlushActive: boolean = false;
-    public pendingDungeonCompletionWaitForCutsceneEnd: boolean = false;
     public deferredCharacterSaveTimer: NodeJS.Timeout | null = null;
     public deferredCharacterSaveReason: string = "";
+    private deferredCharacterSaveInFlight: Promise<void> | null = null;
+    private deferredCharacterSaveGeneration: number = 0;
     public activeDungeonCutsceneScope: string = "";
     public activeDungeonCutsceneRoomId: number = 0;
+    public activeDungeonCutsceneJoinedAtDialogIndex: number = 0;
+    public activeDungeonCutsceneLocalDialogIndex: number = 0;
     public lastDungeonCutsceneStartScope: string = "";
     public lastDungeonCutsceneStartAt: number = 0;
     public lastDungeonCutsceneEndScope: string = "";
@@ -219,7 +272,13 @@ export class Client {
         this.socket = socket;
         this.router = router;
         this.buffer = Buffer.alloc(0);
-        this.packetQueue = Promise.resolve();
+        this.packetQueue = [];
+        this.queuedMovementByKey = new Map();
+        this.packetQueueDrainActive = false;
+        this.packetQueueEnqueued = 0;
+        this.packetQueueProcessed = 0;
+        this.packetQueueCoalesced = 0;
+        this.packetQueueMaxDepth = 0;
         this.outboundUncorkScheduled = false;
         this.rawBytesIn = 0;
         this.rawBytesOut = 0;
@@ -233,6 +292,13 @@ export class Client {
     private onData(data: Buffer): void {
         this.rawBytesIn += data.length;
         this.buffer = Buffer.concat([this.buffer, data]);
+
+        if (this.buffer.length > Client.MAX_BUFFERED_PACKET_BYTES) {
+            console.warn(`[Client] Closing oversized buffered input bytes=${this.buffer.length} token=${this.token}`);
+            this.buffer = Buffer.alloc(0);
+            this.socket.destroy();
+            return;
+        }
 
         if (this.tryServeSocketPolicy()) {
             return;
@@ -250,14 +316,100 @@ export class Client {
 
             const payload = Buffer.from(this.buffer.subarray(4, total));
             this.buffer = this.buffer.subarray(total);
-            DebugLogger.logPacket('IN', this, packetId, payload);
 
-            this.packetQueue = this.packetQueue
-                .then(() => this.router.handle(this, packetId, payload))
-                .catch((err: unknown) => {
-                    console.error(`[Client] Error handling packet 0x${packetId.toString(16)}:`, err);
-                });
+            this.enqueuePacket(packetId, payload);
         }
+    }
+
+    private enqueuePacket(packetId: number, data: Buffer): void {
+        const enqueuedAt = performance.now();
+        const coalesceKey = getActiveMovementPacketKey(packetId, data);
+        this.packetQueueEnqueued += 1;
+
+        if (coalesceKey) {
+            const queued = this.queuedMovementByKey.get(coalesceKey);
+            if (queued) {
+                const merged = mergeActiveMovementPackets(queued.data, data);
+                if (merged) {
+                    queued.data = merged;
+                    queued.enqueuedAt = enqueuedAt;
+                    this.packetQueueCoalesced += 1;
+                    return;
+                }
+            }
+        } else {
+            // Ordered packets are barriers. A later movement update must not
+            // be folded into a movement update that precedes combat/death.
+            this.queuedMovementByKey.clear();
+        }
+
+        if (this.packetQueue.length >= Client.MAX_QUEUED_PACKETS) {
+            console.warn(`[Client] Closing excessive packet queue count=${this.packetQueue.length} token=${this.token}`);
+            this.buffer = Buffer.alloc(0);
+            this.socket.destroy();
+            return;
+        }
+
+        const queuedPacket: QueuedPacket = {
+            packetId,
+            data,
+            enqueuedAt,
+            depthAtEnqueue: this.packetQueue.length + 1,
+            coalesceKey
+        };
+        this.packetQueue.push(queuedPacket);
+        if (coalesceKey) {
+            this.queuedMovementByKey.set(coalesceKey, queuedPacket);
+        }
+        this.packetQueueMaxDepth = Math.max(this.packetQueueMaxDepth, this.packetQueue.length);
+        this.router.noteQueueDepth(this, this.packetQueue.length);
+        void this.drainPacketQueue();
+    }
+
+    private async drainPacketQueue(): Promise<void> {
+        if (this.packetQueueDrainActive) {
+            return;
+        }
+        this.packetQueueDrainActive = true;
+        try {
+            while (this.packetQueue.length > 0) {
+                const packet = this.packetQueue.shift();
+                if (!packet) {
+                    break;
+                }
+                if (packet.coalesceKey && this.queuedMovementByKey.get(packet.coalesceKey) === packet) {
+                    this.queuedMovementByKey.delete(packet.coalesceKey);
+                }
+                await this.router.handle(this, packet.packetId, packet.data, {
+                    enqueuedAt: packet.enqueuedAt,
+                    depthAtEnqueue: packet.depthAtEnqueue
+                });
+                this.packetQueueProcessed += 1;
+            }
+        } catch (err) {
+            console.error('[Client] Packet queue drain failed:', err);
+        } finally {
+            this.packetQueueDrainActive = false;
+            if (this.packetQueue.length > 0) {
+                void this.drainPacketQueue();
+            }
+        }
+    }
+
+    public getPacketQueueMetrics(): {
+        enqueued: number;
+        processed: number;
+        coalesced: number;
+        currentDepth: number;
+        maxDepth: number;
+    } {
+        return {
+            enqueued: this.packetQueueEnqueued,
+            processed: this.packetQueueProcessed,
+            coalesced: this.packetQueueCoalesced,
+            currentDepth: this.packetQueue.length,
+            maxDepth: this.packetQueueMaxDepth
+        };
     }
 
     private tryServeSocketPolicy(): boolean {
@@ -297,7 +449,6 @@ export class Client {
         const header = Buffer.alloc(4);
         header.writeUInt16BE(packetId, 0);
         header.writeUInt16BE(buffer.length, 2);
-        DebugLogger.logPacket('OUT', this, packetId, buffer);
         const payload = Buffer.concat([header, buffer]);
         this.rawBytesOut += payload.length;
         this.scheduleOutboundUncork();
@@ -333,6 +484,7 @@ export class Client {
             return;
         }
 
+        this.deferredCharacterSaveGeneration += 1;
         this.deferredCharacterSaveReason = reason;
         if (this.deferredCharacterSaveTimer) {
             clearTimeout(this.deferredCharacterSaveTimer);
@@ -341,21 +493,58 @@ export class Client {
         const safeDelay = this.resolveDeferredCharacterSaveDelay(reason, delayMs);
         this.deferredCharacterSaveTimer = setTimeout(() => {
             this.deferredCharacterSaveTimer = null;
-            const userId = this.userId;
-            const character = this.character;
-            if (!userId || !character) {
-                return;
-            }
-
-            void db.saveCharacterSnapshot(userId, character).then((characters) => {
-                if (this.userId === userId && this.character === character) {
-                    this.characters = characters;
-                }
-            }).catch((err) => {
-                console.error(`[Client] Deferred character save failed after ${this.deferredCharacterSaveReason || reason}:`, err);
-            });
+            void this.flushDeferredCharacterSave(reason);
         }, safeDelay);
         this.deferredCharacterSaveTimer.unref?.();
+    }
+
+    public async flushCharacterSave(reason: string): Promise<void> {
+        if (!this.userId || !this.character) {
+            return;
+        }
+
+        this.deferredCharacterSaveGeneration += 1;
+        this.deferredCharacterSaveReason = reason;
+        if (this.deferredCharacterSaveTimer) {
+            clearTimeout(this.deferredCharacterSaveTimer);
+            this.deferredCharacterSaveTimer = null;
+        }
+
+        await this.flushDeferredCharacterSave(reason);
+    }
+
+    private async flushDeferredCharacterSave(reason: string): Promise<void> {
+        if (this.deferredCharacterSaveInFlight) {
+            await this.deferredCharacterSaveInFlight.catch(() => undefined);
+        }
+
+        const userId = this.userId;
+        const character = this.character;
+        const generation = this.deferredCharacterSaveGeneration;
+        if (!userId || !character) {
+            return;
+        }
+
+        const save = db.saveCharacterSnapshot(userId, character).then((characters) => {
+            if (this.userId === userId && this.character === character) {
+                this.characters = characters;
+            }
+        }).catch((err) => {
+            console.error(`[Client] Deferred character save failed after ${this.deferredCharacterSaveReason || reason}:`, err);
+        });
+        this.deferredCharacterSaveInFlight = save;
+        await save;
+        if (this.deferredCharacterSaveInFlight === save) {
+            this.deferredCharacterSaveInFlight = null;
+        }
+
+        if (generation !== this.deferredCharacterSaveGeneration && !this.deferredCharacterSaveTimer) {
+            this.deferredCharacterSaveTimer = setTimeout(() => {
+                this.deferredCharacterSaveTimer = null;
+                void this.flushDeferredCharacterSave(this.deferredCharacterSaveReason || reason);
+            }, 0);
+            this.deferredCharacterSaveTimer.unref?.();
+        }
     }
 
     public armPendingTransferGrace(durationMs: number = Client.PENDING_TRANSFER_GRACE_MS): void {
@@ -419,6 +608,8 @@ export class Client {
         this.syncQuestProgress = undefined;
         this.pendingTransferUntil = 0;
         this.mountTransferGraceUntil = 0;
+        this.roomTransitionGraceUntil = 0;
+        MovementAuthority.reset(this, 'gameplay_state_clear');
         this.startedRoomEvents.clear();
         this.knownEntityIds.clear();
         this.entityIdAliases.clear();
@@ -428,12 +619,18 @@ export class Client {
         this.dungeonRun = null;
         this.pendingMissionTurnIns.clear();
         this.authoritativeMaxHp = 100;
+        this.authoritativeArmorClass = 0;
         this.authoritativeCurrentHp = 100;
         this.combatStatsDirty = false;
         this.allowDirtyCombatStatsRegen = false;
         this.lastCombatStatsRefreshRequestAt = 0;
         this.lastCombatStatsSyncedAt = 0;
         this.pendingRespawnRequest = null;
+        if (this.pendingRespawnTimer) {
+            clearTimeout(this.pendingRespawnTimer);
+            this.pendingRespawnTimer = null;
+        }
+        this.respawnPotionCharged = false;
         this.lastCombatActivityAt = 0;
         this.lastCombatRegenTickAt = 0;
         this.enemyDeathRegenArmed = false;
@@ -450,25 +647,21 @@ export class Client {
             this.goblinRiverBossIntroUnlockTimer = null;
         }
         this.goblinRiverBossIntroLockUntil = 0;
-        this.forcedDungeonCompletionScope = "";
-        this.finalizingDungeonCompletionScope = "";
-        this.completedDungeonCompletionScope = "";
-        this.completedDungeonCompletionSentAt = 0;
         this.pendingDungeonCompletionScope = "";
         this.pendingDungeonCompletionRequestedAt = 0;
         this.pendingDungeonCompletionLastSkitAt = 0;
         this.pendingDungeonCompletionNotBeforeAt = 0;
         this.pendingDungeonCompletionSettleMs = 0;
         this.pendingDungeonCompletionPayload = null;
-        this.pendingDungeonCompletionForceSharedScope = "";
         if (this.pendingDungeonCompletionTimer) {
             clearTimeout(this.pendingDungeonCompletionTimer);
             this.pendingDungeonCompletionTimer = null;
         }
         this.pendingDungeonCompletionFlushActive = false;
-        this.pendingDungeonCompletionWaitForCutsceneEnd = false;
         this.activeDungeonCutsceneScope = "";
         this.activeDungeonCutsceneRoomId = 0;
+        this.activeDungeonCutsceneJoinedAtDialogIndex = 0;
+        this.activeDungeonCutsceneLocalDialogIndex = 0;
         this.lastDungeonCutsceneStartScope = "";
         this.lastDungeonCutsceneStartAt = 0;
         this.lastDungeonCutsceneEndScope = "";
@@ -583,6 +776,8 @@ export class Client {
             return;
         }
 
+        clearStoredDungeonSnapshot(this.character);
+
         const safeReturn = LevelConfig.resolveDungeonSafeReturn(
             this.currentLevel || this.character.CurrentLevel?.name,
             this.entryLevel || undefined,
@@ -610,6 +805,7 @@ export class Client {
         const { SocialHandler } = require('../handlers/SocialHandler') as typeof import('../handlers/SocialHandler');
 
         EntityHandler.removeOwnedEntities(this);
+        GlobalState.removeSessionIndexes(this);
         const removedTransferTokens = new Set<number>();
 
         const sessionTokens = new Set<number>();
@@ -702,6 +898,11 @@ export class Client {
 
         SocialHandler.handleSessionClose(this, transferInProgress);
 
+        if (!transferInProgress) {
+            const { DungeonCompletionSystem } = require('./DungeonCompletionSystem') as typeof import('./DungeonCompletionSystem');
+            DungeonCompletionSystem.releaseParticipant(this);
+        }
+
         this.clearGameplayState();
         this.clearIdentityState();
     }
@@ -719,6 +920,13 @@ export class Client {
                 clearTimeout(this.deferredCharacterSaveTimer);
                 this.deferredCharacterSaveTimer = null;
             }
+            RegionPositionPersistence.record(
+                this,
+                this.clientEntID > 0 ? this.entities.get(this.clientEntID) : null,
+                'disconnect',
+                { force: true, persist: false }
+            );
+            RegionPositionPersistence.forget(this);
             this.repairDungeonLocationBeforeSave();
             await db.saveCharacterSnapshot(snapshot.userId, this.character).catch((err) => {
                 console.error(`[Client] Failed to persist character before ${reason}:`, err);
@@ -743,12 +951,24 @@ export class Client {
         const { GlobalState } = require('./GlobalState') as typeof import('./GlobalState');
         const addr = `${this.socket.remoteAddress}:${this.socket.remotePort}`;
         const snapshot = this.createSessionCleanupSnapshot();
+        GlobalState.clients.delete(this);
 
         if (snapshot.userId && this.character) {
             if (this.deferredCharacterSaveTimer) {
                 clearTimeout(this.deferredCharacterSaveTimer);
                 this.deferredCharacterSaveTimer = null;
             }
+            // Record where they actually were before the snapshot goes out. Without this the
+            // only writers of CurrentLevel are the dungeon-return and transfer paths, so an
+            // ordinary disconnect persisted a stale coordinate and the next login dropped the
+            // player in mid-air. persist:false because the save on the next line covers it.
+            RegionPositionPersistence.record(
+                this,
+                this.clientEntID > 0 ? this.entities.get(this.clientEntID) : null,
+                'disconnect',
+                { force: true, persist: false }
+            );
+            RegionPositionPersistence.forget(this);
             this.repairDungeonLocationBeforeSave();
             void db.saveCharacterSnapshot(snapshot.userId, this.character).catch((err) => {
                 console.error('[Client] Failed to persist character on disconnect:', err);

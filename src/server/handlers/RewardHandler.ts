@@ -1,20 +1,26 @@
 import { Client } from '../core/Client';
 import { BitBuffer } from '../network/protocol/bitBuffer';
 import { BitReader } from '../network/protocol/bitReader';
-import { GameData } from '../core/GameData';
+import { GameData, MAX_GEAR_TIER } from '../core/GameData';
 import { GlobalState } from '../core/GlobalState';
 import { noteDungeonRunChestOpened, noteDungeonRunTreasure } from '../core/DungeonRunStats';
 import { CombatHandler } from './CombatHandler';
-import { getClientCharacterKey, getPartyIdForClient } from '../core/PartySync';
-import { areClientsInSameLevelScope, getClientLevelScope } from '../core/LevelScope';
+import { areClientsInSameParty, getClientCharacterKey, getPartyIdForClient } from '../core/PartySync';
+import { areClientsInSameLevelScope, getClientLevelScope, getScopeLevelName } from '../core/LevelScope';
 import { LevelConfig } from '../core/LevelConfig';
 import { upsertInventoryGear } from '../utils/GearInventory';
 import { getEquippedCharmBonuses } from '../utils/CharmBonuses';
 import { getEquippedGearGoldFind } from '../utils/GearGoldBonuses';
-import { getActivePotionBonuses } from '../utils/ConsumableState';
+import { getActivePotionBonuses, getConsumableDef, sendConsumableUpdate } from '../utils/ConsumableState';
+import { LegendsInnChest, claimChestOpening } from '../core/LegendsInnChest';
 import { normalizeCharacterMaterials } from '../utils/MaterialInventory';
 import { PetHandler } from './PetHandler';
 import { Config } from '../core/config';
+import { EntityHandler } from './EntityHandler';
+import { TutorialDungeonMechanics } from '../core/TutorialDungeonMechanics';
+import { DungeonCompletionSystem } from '../core/DungeonCompletionSystem';
+import { AdminRuntimeSettings } from '../core/AdminRuntimeSettings';
+import { CharacterSync } from '../utils/CharacterSync';
 
 interface RewardRequest {
     receiverId: number;
@@ -41,7 +47,49 @@ interface LootReward {
     tier?: number;
     material?: number;
     dye?: number;
+    /**
+     * A consumable riding down on the `material` above.
+     *
+     * The loot-drop packet describes gold, gear, a material, health or a dye and
+     * has no consumable slot, so a catalyst is dropped as a *carrier material*
+     * chosen for its rarity colour, and the pickup grants both - the material the
+     * player saw as well as the catalyst it was carrying. Set only by the Legends'
+     * Inn chest; see `core/LegendsInnChest.ts`.
+     */
+    consumable?: number;
+    __lootDropMetadata?: LootDropServerMetadata;
 }
+
+type LootDropServerMetadata = {
+    lootdropId: number;
+    lootDropNonce: string;
+    sourceEnemyLootDropNonce: string;
+    sourceEnemyCanonicalId: number;
+    ownerToken: number;
+    partyId: number;
+    sharedScope: string;
+    amount: number;
+    type: string;
+    reason: string;
+    caller: string;
+    collected: boolean;
+    collectedBy: number;
+};
+
+type LootReason =
+    | 'canonical_hostile_death'
+    | 'quest_reward'
+    | 'chest_reward'
+    | 'debug'
+    | 'legacy_enemy_reward'
+    | 'unknown';
+
+type LootGrantContext = {
+    sourceLootDropNonce?: string;
+    sourceEnemyCanonicalId?: number;
+    reason?: LootReason;
+    caller?: string;
+};
 
 type XpRewardDebug = {
     attempted: boolean;
@@ -126,9 +174,9 @@ export class RewardHandler {
             { tier: 2, weight: (1 / 100) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.MiniBoss }
         ],
         Boss: [
-            { tier: 0, weight: 1 - ((1 / 5) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss) - ((1 / 25) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss) },
-            { tier: 1, weight: (1 / 5) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss },
-            { tier: 2, weight: (1 / 25) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss }
+            { tier: 0, weight: 1 - ((1 / 8) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss) - ((1 / 60) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss) },
+            { tier: 1, weight: (1 / 8) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss },
+            { tier: 2, weight: (1 / 60) / RewardHandler.GEAR_DROP_CHANCE_BY_RANK.Boss }
         ]
     };
     private static readonly DUNGEON_REALM_MAP: Record<string, string> = {
@@ -247,8 +295,12 @@ export class RewardHandler {
         if (client.entities.has(sourceId)) {
             return client.entities.get(sourceId);
         }
+        const aliasedSourceId = EntityHandler.resolveEntityAlias(client, sourceId);
+        if (aliasedSourceId !== sourceId && client.entities.has(aliasedSourceId)) {
+            return client.entities.get(aliasedSourceId);
+        }
         const levelMap = client.currentLevel ? GlobalState.levelEntities.get(getClientLevelScope(client)) : null;
-        return levelMap?.get(sourceId) ?? null;
+        return levelMap?.get(aliasedSourceId) ?? levelMap?.get(sourceId) ?? null;
     }
 
     private static resolveDropPosition(_client: Client, sourceEntity: any, fallbackX: number, fallbackY: number): { x: number; y: number } {
@@ -290,32 +342,72 @@ export class RewardHandler {
         return { value: weights[weights.length - 1]!.value, roll };
     }
 
-    private static getGearRarityWeights(client: Client, entRank: string): Array<{ tier: 0 | 1 | 2; weight: number }> {
+    private static getGearRarityWeights(client: Client, entRank: string, itemMultiplier: number = 1): Array<{ tier: 0 | 1 | 2; weight: number }> {
         const rankWeights = RewardHandler.isHardDungeon(client.currentLevel)
             ? RewardHandler.GEAR_RARITY_WEIGHTS_HARD_BY_RANK[entRank]
             : RewardHandler.GEAR_RARITY_WEIGHTS_NORMAL_BY_RANK[entRank];
 
-        return rankWeights ?? (
+        const baseWeights = rankWeights ?? (
             RewardHandler.isHardDungeon(client.currentLevel)
                 ? RewardHandler.GEAR_RARITY_WEIGHTS_HARD
                 : RewardHandler.GEAR_RARITY_WEIGHTS_NORMAL
         );
+
+        if (entRank !== 'Boss') {
+            return baseWeights;
+        }
+
+        return RewardHandler.applyBossGearFindOverflow(baseWeights, itemMultiplier);
     }
 
-    private static resolveGearTier(client: Client, entRank: string): number {
-        const weights = RewardHandler.getGearRarityWeights(client, entRank);
+    private static applyBossGearFindOverflow(
+        weights: Array<{ tier: 0 | 1 | 2; weight: number }>,
+        itemMultiplier: number
+    ): Array<{ tier: 0 | 1 | 2; weight: number }> {
+        const multiplier = RewardHandler.sanitizeDropMultiplier(itemMultiplier);
+        if (multiplier <= 1) {
+            return weights;
+        }
+
+        const commonWeight = weights.find((entry) => entry.tier === 0)?.weight ?? 0;
+        const rareWeight = weights.find((entry) => entry.tier === 1)?.weight ?? 0;
+        const legendaryWeight = weights.find((entry) => entry.tier === 2)?.weight ?? 0;
+        if (commonWeight <= 0 || (rareWeight <= 0 && legendaryWeight <= 0)) {
+            return weights;
+        }
+
+        const boostedRare = Math.max(0, rareWeight * multiplier);
+        const boostedLegendary = Math.max(0, legendaryWeight * multiplier);
+        const boostedValuable = boostedRare + boostedLegendary;
+        if (boostedValuable >= 1) {
+            return [
+                { tier: 0, weight: 0 },
+                { tier: 1, weight: boostedValuable > 0 ? boostedRare / boostedValuable : 0 },
+                { tier: 2, weight: boostedValuable > 0 ? boostedLegendary / boostedValuable : 0 }
+            ];
+        }
+
+        return [
+            { tier: 0, weight: 1 - boostedValuable },
+            { tier: 1, weight: boostedRare },
+            { tier: 2, weight: boostedLegendary }
+        ];
+    }
+
+    private static resolveGearTier(client: Client, entRank: string, itemMultiplier: number = 1): number {
+        const weights = RewardHandler.getGearRarityWeights(client, entRank, itemMultiplier);
         return RewardHandler.pickWeighted<number>(weights.map((entry) => ({
             value: entry.tier,
             weight: entry.weight
         })));
     }
 
-    private static resolveGearTierDebug(client: Client, entRank: string): {
+    private static resolveGearTierDebug(client: Client, entRank: string, itemMultiplier: number = 1): {
         tier: number;
         tierRoll: number | null;
         tierWeights: Array<{ tier: number; weight: number }>;
     } {
-        const tierWeights = RewardHandler.getGearRarityWeights(client, entRank);
+        const tierWeights = RewardHandler.getGearRarityWeights(client, entRank, itemMultiplier);
         const weights = tierWeights.map((entry) => ({
             value: entry.tier,
             weight: entry.weight
@@ -328,8 +420,8 @@ export class RewardHandler {
         };
     }
 
-    private static getGearTierWeights(client: Client, entRank: string): Array<{ tier: number; weight: number }> {
-        return RewardHandler.getGearRarityWeights(client, entRank);
+    private static getGearTierWeights(client: Client, entRank: string, itemMultiplier: number = 1): Array<{ tier: number; weight: number }> {
+        return RewardHandler.getGearRarityWeights(client, entRank, itemMultiplier);
     }
 
     private static sanitizeDropMultiplier(value: number | undefined): number {
@@ -340,17 +432,25 @@ export class RewardHandler {
         const rank = String(entType?.EntRank ?? 'Minion');
         const baseChance = RewardHandler.MATERIAL_DROP_CHANCE_BY_RANK[rank] ?? RewardHandler.MATERIAL_DROP_CHANCE_BY_RANK.Minion;
         const multiplier = RewardHandler.sanitizeDropMultiplier(reward.gearMultiplier);
-        return Math.max(0, Math.min(1, baseChance * multiplier));
+        return AdminRuntimeSettings.scaleMaterialChance(baseChance * multiplier);
     }
 
-    private static resolveGearDropChance(entType: any, reward: RewardRequest): number {
+    private static resolveGearDropChance(entType: any, itemMultiplier: number): number {
         const rawChance = Number(entType?.ItemDropChance ?? 0);
         if (rawChance <= 0) {
             return 0;
         }
 
-        const multiplier = RewardHandler.sanitizeDropMultiplier(reward.itemMultiplier);
-        return Math.max(0, Math.min(1, rawChance * multiplier));
+        const multiplier = RewardHandler.sanitizeDropMultiplier(itemMultiplier);
+        return AdminRuntimeSettings.scaleGearChance(rawChance * multiplier);
+    }
+
+    private static resolveGearFindMultiplier(client: Client): number {
+        const petBonuses = PetHandler.getEquippedPetBonusRates(client.character);
+        const charmBonuses = getEquippedCharmBonuses(client.character);
+        const potionBonuses = getActivePotionBonuses(client.character, client.currentLevel);
+        const gearFindRate = Math.max(0, petBonuses.itemFind + charmBonuses.itemFind + potionBonuses.itemFind);
+        return RewardHandler.sanitizeDropMultiplier(1 + gearFindRate);
     }
 
     private static resolveMaterialDropRarity(client: Client): 'M' | 'R' | 'L' {
@@ -493,9 +593,242 @@ export class RewardHandler {
         return LevelConfig.isDungeonLevel(normalizedLevel) || Boolean(RewardHandler.DUNGEON_REALM_MAP[normalizedLevel]);
     }
 
-    private static spawnLoot(client: Client, x: number, y: number, reward: LootReward, offsetX: number = 0, offsetY: number = 0): void {
+    private static getRewardType(reward: LootReward): string {
+        if (reward.gold && reward.gold > 0) return 'gold';
+        if (reward.health && reward.health > 0) return 'health';
+        if (reward.gear && reward.gear > 0) return 'gear';
+        if (reward.material && reward.material > 0) return 'material';
+        if (reward.dye && reward.dye > 0) return 'dye';
+        return 'unknown';
+    }
+
+    private static getRewardAmount(reward: LootReward): number {
+        if (reward.gold && reward.gold > 0) return reward.gold;
+        if (reward.health && reward.health > 0) return reward.health;
+        if (reward.gear && reward.gear > 0) return reward.gear;
+        if (reward.material && reward.material > 0) return reward.material;
+        if (reward.dye && reward.dye > 0) return reward.dye;
+        return 0;
+    }
+
+    private static getCanonicalLootSource(metadata: LootDropServerMetadata | undefined): any {
+        if (!metadata?.sharedScope || metadata.sourceEnemyCanonicalId <= 0) {
+            return null;
+        }
+
+        return GlobalState.levelEntities.get(metadata.sharedScope)?.get(metadata.sourceEnemyCanonicalId) ?? null;
+    }
+
+    private static normalizeNumberSet(value: unknown): Set<number> {
+        if (value instanceof Set) {
+            return new Set<number>(Array.from(value).map((entry) => Math.round(Number(entry) || 0)).filter((entry) => entry > 0));
+        }
+        if (Array.isArray(value)) {
+            return new Set<number>(value.map((entry) => Math.round(Number(entry) || 0)).filter((entry) => entry > 0));
+        }
+        return new Set<number>();
+    }
+
+    private static normalizeStringSet(value: unknown): Set<string> {
+        if (value instanceof Set) {
+            return new Set<string>(Array.from(value).map((entry) => String(entry)));
+        }
+        if (Array.isArray(value)) {
+            return new Set<string>(value.map((entry) => String(entry)));
+        }
+        return new Set<string>();
+    }
+
+    private static isEnemyLootReason(reason: string): boolean {
+        return reason === 'canonical_hostile_death' || reason === 'legacy_enemy_reward';
+    }
+
+    private static requiresCanonicalHostileLootContext(
+        levelName: string | null | undefined,
+        sourceEntity: any = null,
+        sourceEnemyCanonicalId: number = 0
+    ): boolean {
+        const normalizedLevel = LevelConfig.normalizeLevelName(levelName);
+        if (!EntityHandler.usesServerAuthorityHostiles(normalizedLevel)) {
+            return false;
+        }
+        if (normalizedLevel !== 'TutorialDungeon') {
+            return true;
+        }
+
+        const canonicalId = Math.max(
+            0,
+            Math.round(Number(
+                sourceEnemyCanonicalId ||
+                sourceEntity?.canonicalEntityId ||
+                sourceEntity?.sharedCanonicalId ||
+                (!sourceEntity?.clientSpawned ? sourceEntity?.id : 0) ||
+                0
+            ))
+        );
+        return canonicalId === TutorialDungeonMechanics.TAG_UGO_BOSS_ID;
+    }
+
+    private static isCanonicalDeathLootContextValid(
+        levelScope: string,
+        sourceEnemyCanonicalId: number,
+        sourceEnemyLootDropNonce: string
+    ): boolean {
+        if (sourceEnemyCanonicalId <= 0 || !sourceEnemyLootDropNonce) {
+            return false;
+        }
+
+        const canonicalEntity = GlobalState.levelEntities.get(levelScope)?.get(sourceEnemyCanonicalId);
+        return Boolean(
+            canonicalEntity &&
+            canonicalEntity.dead === true &&
+            canonicalEntity.destroyed === true &&
+            Math.max(0, Math.round(Number(canonicalEntity.deathFinalizedAt ?? 0))) > 0 &&
+            String(canonicalEntity.lootDropNonce ?? '') === sourceEnemyLootDropNonce
+        );
+    }
+
+    private static isHostileRewardSource(sourceEntity: any): boolean {
+        return Boolean(sourceEntity && !sourceEntity.isPlayer && Number(sourceEntity.team ?? 0) === 2);
+    }
+
+    private static getRewardSourceReason(sourceEntity: any): LootReason {
+        const entName = String(sourceEntity?.name ?? sourceEntity?.EntName ?? sourceEntity?.entName ?? '').trim();
+        const entType = entName ? GameData.getEntType(entName) ?? {} : {};
+        const behavior = String(entType.Behavior ?? sourceEntity?.behavior ?? sourceEntity?.Behavior ?? '').trim();
+        if (/treasurechest/i.test(entName) || behavior === 'TreasureChest') {
+            return 'chest_reward';
+        }
+
+        if (RewardHandler.isHostileRewardSource(sourceEntity)) {
+            return 'legacy_enemy_reward';
+        }
+
+        return 'unknown';
+    }
+
+    private static formatLootSyncFields(fields: Record<string, unknown>): string {
+        return Object.entries(fields)
+            .map(([key, value]) => `${key}=${String(value ?? '').replace(/\s+/g, '_')}`)
+            .join(' ');
+    }
+
+    private static grantGoldLoot(client: Client, amount: number): boolean {
+        if (!client.character || amount <= 0) {
+            return false;
+        }
+
+        client.character.gold = Number(client.character.gold ?? 0) + amount;
+        noteDungeonRunTreasure(client, amount);
+        RewardHandler.sendGoldReward(client, amount, false);
+        return true;
+    }
+
+    private static grantMaterialLoot(client: Client, materialId: number): boolean {
+        if (!client.character || materialId <= 0) {
+            return false;
+        }
+
+        const materials = normalizeCharacterMaterials(client.character);
+        const existing = materials.find((entry: any) => Number(entry.materialID ?? 0) === materialId);
+        if (existing) {
+            existing.count = Number(existing.count ?? 0) + 1;
+        } else {
+            materials.push({ materialID: materialId, count: 1 });
+        }
+        client.character.materials = materials;
+        RewardHandler.sendMaterialReward(client, materialId, 1);
+        return true;
+    }
+
+    /**
+     * Puts a catalyst in the bag and tells the client its new count.
+     *
+     * The 0x32 loot packet has no consumable slot, so this is the other half of
+     * the carrier-material trick: what the player walked over was drawn as a
+     * material, and this is what they actually receive.
+     */
+    private static grantConsumableLoot(client: Client, consumableId: number): boolean {
+        if (!client.character || consumableId <= 0 || !getConsumableDef(consumableId)) {
+            return false;
+        }
+
+        const consumables = Array.isArray(client.character.consumables) ? client.character.consumables : [];
+        const existing = consumables.find((entry: any) => Number(entry?.consumableID ?? 0) === consumableId);
+        if (existing) {
+            existing.count = Math.max(0, Number(existing.count ?? 0)) + 1;
+        } else {
+            consumables.push({ consumableID: consumableId, count: 1 });
+        }
+        client.character.consumables = consumables;
+        sendConsumableUpdate(client, consumableId);
+        return true;
+    }
+
+    private static spawnLoot(
+        client: Client,
+        x: number,
+        y: number,
+        reward: LootReward,
+        offsetX: number = 0,
+        offsetY: number = 0,
+        context: LootGrantContext = {}
+    ): void {
         const lootId = ++RewardHandler.nextLootId;
-        client.pendingLoot.set(lootId, reward);
+        const type = RewardHandler.getRewardType(reward);
+        const sourceEnemyLootDropNonce = String(context.sourceLootDropNonce ?? '');
+        const sourceEnemyCanonicalId = Math.max(0, Math.round(Number(context.sourceEnemyCanonicalId ?? 0)));
+        const reason = context.reason ?? 'unknown';
+        const caller = String(context.caller ?? 'unknown');
+        const levelScope = getClientLevelScope(client);
+        const metadata: LootDropServerMetadata = {
+            lootdropId: lootId,
+            lootDropNonce: sourceEnemyLootDropNonce
+                ? `${sourceEnemyLootDropNonce}:${client.token}:${lootId}`
+                : `${levelScope}:loot:${client.token}:${lootId}`,
+            sourceEnemyLootDropNonce,
+            sourceEnemyCanonicalId,
+            ownerToken: Math.max(0, Math.round(Number(client.token ?? 0))),
+            partyId: Math.max(0, Math.round(Number(getPartyIdForClient(client) ?? 0))),
+            sharedScope: levelScope,
+            amount: RewardHandler.getRewardAmount(reward),
+            type,
+            reason,
+            caller,
+            collected: false,
+            collectedBy: 0
+        };
+        if (
+            RewardHandler.requiresCanonicalHostileLootContext(
+                getScopeLevelName(levelScope),
+                null,
+                metadata.sourceEnemyCanonicalId
+            ) &&
+            RewardHandler.isEnemyLootReason(reason) &&
+            !RewardHandler.isCanonicalDeathLootContextValid(levelScope, metadata.sourceEnemyCanonicalId, metadata.sourceEnemyLootDropNonce)
+        ) {
+            if (metadata.sourceEnemyCanonicalId === 0) {
+                console.error(`[RewardHandler][InvalidHostileLootContext] ${RewardHandler.formatLootSyncFields({
+                    viewer: client.character?.name ?? '',
+                    token: client.token,
+                    scope: levelScope,
+                    lootdropId: lootId,
+                    caller
+                })}`);
+            }
+            return;
+        }
+        // Every reward type — materials included — lands on the ground and is claimed by walking
+        // over it. Materials used to be credited straight into the bag here whenever a loot-magnet
+        // pet was out; that silent auto-add is gone, so a material is a visible pickup like gold,
+        // gear, health and dye.
+        const pendingReward: LootReward = { ...reward, __lootDropMetadata: metadata };
+        client.pendingLoot.set(lootId, pendingReward);
+        const sourceEntity = RewardHandler.getCanonicalLootSource(metadata);
+        if (sourceEntity && typeof sourceEntity === 'object') {
+            sourceEntity.lootDrops = sourceEntity.lootDrops instanceof Map ? sourceEntity.lootDrops : new Map<number, LootDropServerMetadata>();
+            sourceEntity.lootDrops.set(lootId, metadata);
+        }
         client.send(0x32, RewardHandler.buildLootdrop(lootId, x + offsetX, y + offsetY, reward));
     }
 
@@ -516,19 +849,36 @@ export class RewardHandler {
         };
     }
 
-    private static applyXpReward(client: Client, amount: number): boolean {
+    static grantExperience(client: Client, amount: number): number {
         if (!client.character || amount <= 0) {
-            return false;
+            return 0;
         }
 
         const xpDebug = RewardHandler.resolveXpRewardDebug(client, amount);
         const totalAmount = xpDebug.finalExp;
+        if (totalAmount <= 0) {
+            return 0;
+        }
 
+        const previousLevel = Math.max(1, Number(client.character.level ?? 1));
         client.character.xp = Number(client.character.xp ?? 0) + totalAmount;
         client.character.level = GameData.getPlayerLevelFromXp(Number(client.character.xp ?? 0));
         RewardHandler.sendXpReward(client, totalAmount);
         PetHandler.applyActivePetExperience(client, totalAmount);
-        return true;
+
+        if (Number(client.character.level) !== previousLevel) {
+            EntityHandler.refreshPlayerSnapshot(client);
+            client.combatStatsDirty = true;
+            client.allowDirtyCombatStatsRegen = true;
+            client.lastCombatStatsRefreshRequestAt = Date.now();
+            CharacterSync.requestCombatStatsRefresh(client);
+        }
+
+        return totalAmount;
+    }
+
+    private static applyXpReward(client: Client, amount: number): boolean {
+        return RewardHandler.grantExperience(client, amount) > 0;
     }
 
     private static collectOwnedGearTierKeys(client: Client): Set<string> {
@@ -538,7 +888,7 @@ export class RewardHandler {
             if (!Number.isFinite(normalizedGearId) || normalizedGearId <= 0) {
                 return;
             }
-            const normalizedTier = Math.max(0, Math.min(2, Math.round(Number(tier ?? 0) || 0)));
+            const normalizedTier = Math.max(0, Math.min(MAX_GEAR_TIER, Math.round(Number(tier ?? 0) || 0)));
             for (let t = 0; t <= normalizedTier; t++) {
                 owned.add(GameData.buildGearTierKey(normalizedGearId, t));
             }
@@ -559,6 +909,15 @@ export class RewardHandler {
         return owned;
     }
 
+    private static collectOwnedDyeIds(client: Client): Set<number> {
+        return new Set<number>(
+            (Array.isArray(client.character?.OwnedDyes) ? client.character.OwnedDyes : [])
+                .map((dye: unknown) => Number(dye))
+                .filter((dyeId: number) => dyeId > 0)
+                .map((dyeId: number) => Math.round(dyeId))
+        );
+    }
+
     private static maybeOverrideDungeonReward(client: Client, sourceEntity: any, reward: RewardRequest): {
         exp: number;
         gold: number;
@@ -568,8 +927,8 @@ export class RewardHandler {
         gearTier: number;
         dyeId: number;
     } {
-        let exp = reward.exp;
-        let gold = reward.gold;
+        let exp = AdminRuntimeSettings.scaleXp(reward.exp);
+        let gold = AdminRuntimeSettings.scaleGold(reward.gold);
         const packetGold = gold;
         let hpGain = reward.hpGain;
         let materialId = 0;
@@ -601,23 +960,18 @@ export class RewardHandler {
         const isChainsEnemy = entName.startsWith('Chains');
         const isLargeEnemy = entRank === 'Lieutenant' || entRank === 'MiniBoss' || entRank === 'Boss';
         const allowItemDrop = !isChainsEnemy && (!isIntroEnemy || isLargeEnemy);
-        const rewardClass = String(entType?.RewardClass ?? '');
         const shouldApplyDropTables = isDungeonEnemyReward &&
             allowItemDrop &&
             itemLootAllowedByClass;
-        const baseMaterialChance = RewardHandler.MATERIAL_DROP_CHANCE_BY_RANK[entRank] ?? RewardHandler.MATERIAL_DROP_CHANCE_BY_RANK.Minion;
-        const packetMaterialMultiplier = RewardHandler.sanitizeDropMultiplier(reward.gearMultiplier);
-        const packetItemMultiplier = RewardHandler.sanitizeDropMultiplier(reward.itemMultiplier);
-        const materialFindRate = petBonuses.craftFind + charmBonuses.craftFind + potionBonuses.craftFind;
-        const itemFindRate = petBonuses.itemFind + charmBonuses.itemFind + potionBonuses.itemFind;
         const goldFindRate = petBonuses.goldFind + charmBonuses.goldFind + gearGoldFind + potionBonuses.goldFind;
         const shouldRollMaterial = shouldApplyDropTables && Boolean(realm);
-        const shouldRollGear = shouldApplyDropTables;
+        const shouldRollGear = shouldApplyDropTables && isLargeEnemy;
         const materialChance = shouldRollMaterial
             ? RewardHandler.resolveMaterialDropChance(entType, reward)
             : 0;
+        const gearFindMultiplier = RewardHandler.resolveGearFindMultiplier(client);
         const gearChance = shouldRollGear
-            ? RewardHandler.resolveGearDropChance(entType, reward)
+            ? RewardHandler.resolveGearDropChance(entType, gearFindMultiplier)
             : 0;
         const dyeDebug = shouldApplyDropTables
             ? RewardHandler.resolveDyeDropRarityDebug(client, entType)
@@ -633,150 +987,26 @@ export class RewardHandler {
             };
 
         // Küçük Intro düşmanlar (Minion rank) ve Chains entitylerinden eşya düşmez
-        let materialRoll: number | null = null;
-        let materialRarity: 'M' | 'R' | 'L' | null = null;
-        let materialRarityRoll: number | null = null;
-        let materialRarityWeights = RewardHandler.getMaterialRarityWeights(client);
-        if (realm && materialChance > 0) {
-            materialRoll = Math.random();
-            if (materialRoll < materialChance) {
-                const rarityResult = RewardHandler.resolveMaterialDropRarityDebug(client);
-                materialRarity = rarityResult.rarity;
-                materialRarityRoll = rarityResult.rarityRoll;
-                materialRarityWeights = rarityResult.rarityWeights;
-                materialId = GameData.getRandomMaterialForRealm(realm, [materialRarity]);
-            }
+        if (realm && materialChance > 0 && Math.random() < materialChance) {
+            const rarityResult = RewardHandler.resolveMaterialDropRarityDebug(client);
+            materialId = GameData.getRandomMaterialForRealm(realm, [rarityResult.rarity]);
         }
         if (allowItemDrop && dyeDebug.rarity) {
-            dyeId = GameData.getRandomDyeId([dyeDebug.rarity]);
+            dyeId = GameData.getRandomDyeId([dyeDebug.rarity], RewardHandler.collectOwnedDyeIds(client));
         }
-        let gearRoll: number | null = null;
-        let gearTierRoll: number | null = null;
-        let gearTierWeights = RewardHandler.getGearTierWeights(client, entRank);
-        if (allowItemDrop && gearChance > 0) {
-            gearRoll = Math.random();
-            if (gearRoll < gearChance) {
-                const tierResult = RewardHandler.resolveGearTierDebug(client, entRank);
-                gearTier = tierResult.tier;
-                gearTierRoll = tierResult.tierRoll;
-                gearTierWeights = tierResult.tierWeights;
-                gearId = GameData.getGearIdForEntity(
-                    entName,
-                    playerClass,
-                    undefined,
-                    client.currentLevel,
-                    gearTier,
-                    ownedGearTierKeys
-                );
-            }
-        }
-        let goldBeforeFind = gold;
-        let goldAfterFind = gold;
-        let goldFindApplied = false;
-        if (gold > 0 && goldFindRate > 0) {
-            goldFindApplied = true;
-            goldAfterFind = Math.max(0, Math.round(gold * (1 + goldFindRate)));
-            gold = goldAfterFind;
-        }
-
-        const xpDebug = RewardHandler.resolveXpRewardDebug(client, exp, reward.exp);
-        const shouldLogRewardRoll = shouldRollMaterial || shouldRollGear || dyeDebug.eligible || packetGold > 0 || goldFindRate > 0 || xpDebug.attempted;
-        if (Config.REWARD_ROLL_DEBUG && shouldLogRewardRoll) {
-            console.log('[RewardRollDebug]', {
-                character: client.character?.name ?? '',
-                level: client.currentLevel,
-                sourceId: reward.sourceId,
-                receiverId: reward.receiverId,
+        if (shouldRollGear && gearChance > 0 && Math.random() < gearChance) {
+            gearTier = RewardHandler.resolveGearTier(client, entRank, gearFindMultiplier);
+            gearId = GameData.getGearIdForEntity(
                 entName,
-                entRank,
-                rewardClass,
                 playerClass,
-                realm,
-                allowItemDrop,
-                itemLootAllowedByClass,
-                rolls: {
-                    material: {
-                        attempted: shouldRollMaterial,
-                        baseChance: baseMaterialChance,
-                        packetMultiplier: packetMaterialMultiplier,
-                        petFind: petBonuses.craftFind,
-                        charmFind: charmBonuses.craftFind,
-                        potionFind: potionBonuses.craftFind,
-                        totalFindRate: materialFindRate,
-                        finalMultiplier: packetMaterialMultiplier,
-                        finalChance: materialChance,
-                        dropRoll: materialRoll,
-                        dropped: materialId > 0,
-                        rarityWeights: materialRarityWeights,
-                        rarityTotalChances: RewardHandler.buildRarityTotalChances(materialChance, materialRarityWeights),
-                        rarityRoll: materialRarityRoll,
-                        rarity: materialRarity,
-                        materialId
-                    },
-                    gear: {
-                        attempted: shouldRollGear,
-                        baseChance: Number(entType?.ItemDropChance ?? 0),
-                        packetMultiplier: packetItemMultiplier,
-                        packetRawMultiplier: reward.itemMultiplier,
-                        packetDropItem: reward.dropItem,
-                        packetDropGear: reward.dropGear,
-                        packetDropMaterial: reward.dropMaterial,
-                        petFind: petBonuses.itemFind,
-                        charmFind: charmBonuses.itemFind,
-                        potionFind: potionBonuses.itemFind,
-                        totalFindRate: itemFindRate,
-                        finalMultiplier: packetItemMultiplier,
-                        finalChance: gearChance,
-                        dropRoll: gearRoll,
-                        dropped: gearId > 0,
-                        rarityWeights: gearTierWeights,
-                        rarityTotalChances: RewardHandler.buildTierTotalChances(gearChance, gearTierWeights),
-                        rarityRoll: gearTierRoll,
-                        tier: gearId > 0 ? gearTier : null,
-                        rolledTier: gearTierRoll !== null ? gearTier : null,
-                        gearId
-                    },
-                    dye: {
-                        attempted: dyeDebug.eligible,
-                        baseChance: dyeDebug.baseChance,
-                        finalChance: dyeDebug.finalChance,
-                        rankEligible: dyeDebug.eligible,
-                        affectedByFind: false,
-                        blockedByItemDropRules: dyeDebug.dropped && !allowItemDrop,
-                        dropRoll: dyeDebug.dropRoll,
-                        dropped: dyeId > 0,
-                        rarityWeights: dyeDebug.rarityWeights,
-                        rarityTotalChances: RewardHandler.buildRarityTotalChances(dyeDebug.finalChance, dyeDebug.rarityWeights),
-                        rarityRoll: dyeDebug.rarityRoll,
-                        rarity: dyeId > 0 ? dyeDebug.rarity : null,
-                        rolledRarityBeforeItemDropRules: dyeDebug.rarity,
-                        dyeId
-                    },
-                    gold: {
-                        attempted: packetGold > 0,
-                        packetGold,
-                        baseGold: goldBeforeFind,
-                        petFind: petBonuses.goldFind,
-                        charmFind: charmBonuses.goldFind,
-                        gearFind: gearGoldFind,
-                        potionFind: potionBonuses.goldFind,
-                        totalFindRate: goldFindRate,
-                        multiplier: 1 + goldFindRate,
-                        findApplied: goldFindApplied,
-                        finalGold: goldAfterFind
-                    },
-                    exp: {
-                        attempted: xpDebug.attempted,
-                        packetExp: xpDebug.packetExp,
-                        baseExp: xpDebug.baseExp,
-                        petBonus: xpDebug.petBonus,
-                        potionBonus: xpDebug.potionBonus,
-                        totalBonusRate: xpDebug.totalBonusRate,
-                        multiplier: xpDebug.multiplier,
-                        finalExp: xpDebug.finalExp
-                    }
-                }
-            });
+                undefined,
+                client.currentLevel,
+                gearTier,
+                ownedGearTierKeys
+            );
+        }
+        if (gold > 0 && goldFindRate > 0) {
+            gold = Math.max(0, Math.round(gold * (1 + goldFindRate)));
         }
 
         const needsFallback = gold <= 0 && !shouldRollGear && !shouldRollMaterial;
@@ -804,11 +1034,14 @@ export class RewardHandler {
         if (!client.userId || !client.character) {
             return;
         }
-        const index = client.characters.findIndex((entry) => entry.name === client.character?.name);
+        const characters = Array.isArray((client as Client & { characters?: unknown }).characters)
+            ? client.characters
+            : [];
+        const index = characters.findIndex((entry) => entry.name === client.character?.name);
         if (index >= 0) {
-            client.characters[index] = client.character;
-        } else {
-            client.characters.push(client.character);
+            characters[index] = client.character;
+        } else if (characters === client.characters) {
+            characters.push(client.character);
         }
         if (typeof client.scheduleCharacterSave === 'function') {
             client.scheduleCharacterSave(reason);
@@ -816,8 +1049,8 @@ export class RewardHandler {
     }
 
     private static findOnlineContributor(levelName: string, contributorKey: string): Client | null {
-        for (const other of GlobalState.sessionsByToken.values()) {
-            if (!other.playerSpawned || !other.character || getClientLevelScope(other) !== levelName) {
+        for (const other of GlobalState.getSessionsInLevelScope(levelName)) {
+            if (!other.playerSpawned || !other.character) {
                 continue;
             }
             if (getClientCharacterKey(other) === contributorKey) {
@@ -840,7 +1073,7 @@ export class RewardHandler {
             return;
         }
 
-        for (const other of GlobalState.sessionsByToken.values()) {
+        for (const other of GlobalState.getSessionsInParty(contributorPartyId)) {
             if (
                 !other.playerSpawned ||
                 !other.character ||
@@ -865,6 +1098,21 @@ export class RewardHandler {
                 continue;
             }
 
+            // A reward is shared with your party and with nobody else.
+            //
+            // Contributions are keyed `levelScope:entityId:nonce`, and an overworld scope is
+            // the bare level name -- no instance id, because everyone standing in NewbieRoad
+            // is in one scope. Overworld hostiles are private client spawns, so each player's
+            // own client invents their ids, and two players' local ids collide constantly.
+            // Both then show up as contributors to "the same" entity, and two strangers who
+            // never met were each granted the other's kill.
+            //
+            // Filtering here rather than at the key covers the honest case too: two unpartied
+            // players hitting one genuinely shared boss are still not splitting its reward.
+            if (contributor !== client && !areClientsInSameParty(client, contributor)) {
+                continue;
+            }
+
             RewardHandler.addContributorRecipients(scopeKey, contributor, recipients);
         }
 
@@ -878,30 +1126,91 @@ export class RewardHandler {
         };
     }
 
+    private static getBossPrimaryRewardKey(client: Client, sourceEntity: any, sourceId: number): string {
+        if (
+            !RewardHandler.isDungeonLevel(client.currentLevel) ||
+            !sourceEntity ||
+            sourceEntity.isPlayer
+        ) {
+            return '';
+        }
+
+        const isBoss = GameData.isDungeonBossEntity(client.currentLevel, sourceEntity) ||
+            GameData.getEntityRank(sourceEntity) === 'Boss';
+        if (!isBoss) {
+            return '';
+        }
+
+        const canonicalId = Math.max(
+            0,
+            Math.round(Number(
+                sourceEntity.canonicalEntityId ??
+                sourceEntity.sharedCanonicalId ??
+                sourceEntity.id ??
+                sourceId ??
+                0
+            ))
+        );
+        return canonicalId > 0
+            ? `${getClientLevelScope(client)}:boss-primary:${canonicalId}`
+            : '';
+    }
+
     private static applyRewardToRecipient(
         client: Client,
         reward: RewardRequest,
-        rewardNonce: number,
+        rewardNonce: string | number,
         sourceEntity: any,
-        dropPosition: { x: number; y: number }
-    ): void {
+        dropPosition: { x: number; y: number },
+        context: LootGrantContext = {}
+    ): boolean {
         if (!client.character || !client.currentLevel) {
-            return;
+            return false;
         }
 
         const rewardKey = `${getClientLevelScope(client)}:${reward.sourceId}:${rewardNonce}`;
         if (client.processedRewardSources.has(rewardKey)) {
-            return;
+            if (context.sourceLootDropNonce) {
+            }
+            return false;
+        }
+
+        const bossPrimaryRewardKey = RewardHandler.getBossPrimaryRewardKey(client, sourceEntity, reward.sourceId);
+        const bossPrimaryRewardAlreadyGranted = Boolean(
+            bossPrimaryRewardKey && client.processedRewardSources.has(bossPrimaryRewardKey)
+        );
+        const resolved = RewardHandler.maybeOverrideDungeonReward(client, sourceEntity, reward);
+        if (bossPrimaryRewardAlreadyGranted) {
+            // Scripted phase revives may still produce the authored health drop,
+            // but XP, currency and hunting loot belong to the boss's first life.
+            resolved.exp = 0;
+            resolved.gold = 0;
+            resolved.materialId = 0;
+            resolved.gearId = 0;
+            resolved.gearTier = 0;
+            resolved.dyeId = 0;
+        }
+        const hasReward = resolved.exp > 0 || resolved.gold > 0 || resolved.hpGain > 0 ||
+            resolved.gearId > 0 || resolved.materialId > 0 || resolved.dyeId > 0;
+        if (!hasReward) {
+            return false;
         }
         client.processedRewardSources.add(rewardKey);
-
-        const resolved = RewardHandler.maybeOverrideDungeonReward(client, sourceEntity, reward);
+        if (bossPrimaryRewardKey) {
+            client.processedRewardSources.add(bossPrimaryRewardKey);
+        }
+        const reason = context.reason ?? 'unknown';
+        const caller = context.caller ?? 'unknown';
+        if (context.sourceLootDropNonce) {
+        }
         const shouldSave = RewardHandler.applyXpReward(client, resolved.exp);
 
         noteDungeonRunChestOpened(client, reward.sourceId, sourceEntity);
 
         if (resolved.gold > 0) {
-            RewardHandler.spawnLoot(client, dropPosition.x, dropPosition.y, { gold: resolved.gold });
+            // Gold always lands where the kill happened. Whoever reaches it first — the follower
+            // pet or the player — collects it, which is decided client-side in Loot.method_1300.
+            RewardHandler.spawnLoot(client, dropPosition.x, dropPosition.y, { gold: resolved.gold }, 0, 0, context);
         }
         if (resolved.hpGain > 0) {
             RewardHandler.spawnLoot(
@@ -910,7 +1219,8 @@ export class RewardHandler {
                 dropPosition.y,
                 { health: resolved.hpGain },
                 Math.floor(Math.random() * 31) - 15,
-                Math.floor(Math.random() * 31) - 15
+                Math.floor(Math.random() * 31) - 15,
+                context
             );
         }
         if (resolved.gearId > 0) {
@@ -920,7 +1230,8 @@ export class RewardHandler {
                 dropPosition.y,
                 { gear: resolved.gearId, tier: resolved.gearTier },
                 Math.floor(Math.random() * 41) - 20,
-                Math.floor(Math.random() * 21) - 10
+                Math.floor(Math.random() * 21) - 10,
+                context
             );
         }
         if (resolved.materialId > 0) {
@@ -930,7 +1241,8 @@ export class RewardHandler {
                 dropPosition.y,
                 { material: resolved.materialId },
                 Math.floor(Math.random() * 41) - 20,
-                Math.floor(Math.random() * 21) - 10
+                Math.floor(Math.random() * 21) - 10,
+                context
             );
         }
         if (resolved.dyeId > 0) {
@@ -940,13 +1252,179 @@ export class RewardHandler {
                 dropPosition.y,
                 { dye: resolved.dyeId },
                 Math.floor(Math.random() * 41) - 20,
-                Math.floor(Math.random() * 21) - 10
+                Math.floor(Math.random() * 21) - 10,
+                context
             );
         }
 
         if (shouldSave) {
             RewardHandler.persistCharacter(client, 'reward grant');
         }
+        return true;
+    }
+
+    private static handleAuthoritativeTutorialChestReward(
+        client: Client,
+        reward: RewardRequest,
+        sourceEntity: any,
+        dropPosition: { x: number; y: number }
+    ): boolean {
+        if (!TutorialDungeonMechanics.isTutorialDungeon(client.currentLevel)) {
+            return false;
+        }
+        const authority = TutorialDungeonMechanics.getAuthorityEntity(
+            sourceEntity ?? { id: reward.sourceId },
+            Number(client.currentRoomId ?? 0)
+        );
+        if (!authority || (authority.role !== 'tutorial_chest' && authority.role !== 'boss_chest')) {
+            return false;
+        }
+
+        const levelScope = getClientLevelScope(client);
+        if (!TutorialDungeonMechanics.isWorldObjectResolved(levelScope, authority.stableId)) {
+            const transition = TutorialDungeonMechanics.commitClientObjectDefeat(client, sourceEntity);
+            if (!transition.accepted) {
+                return true;
+            }
+            EntityHandler.broadcastTutorialDungeonObjectTransition(client, authority);
+        }
+
+        const recipients = Array.from(GlobalState.getSessionsInLevelScope(levelScope)).filter((recipient) =>
+            recipient.playerSpawned &&
+            Boolean(recipient.character)
+        );
+        for (const recipient of recipients) {
+            const participantKey = DungeonCompletionSystem.getParticipantKey(recipient);
+            const claim = TutorialDungeonMechanics.claimChestReward(
+                levelScope,
+                authority.stableId,
+                participantKey,
+                client.token
+            );
+            if (!claim.accepted) {
+                continue;
+            }
+            RewardHandler.applyRewardToRecipient(
+                recipient,
+                { ...reward, sourceId: authority.id },
+                `${authority.stableId}:${claim.openVersion}:${participantKey}`,
+                sourceEntity ?? {
+                    id: authority.id,
+                    name: authority.name,
+                    x: authority.x,
+                    y: authority.y,
+                    roomId: authority.roomId,
+                    tutorialDungeonStableId: authority.stableId
+                },
+                dropPosition,
+                { reason: 'chest_reward', caller: 'authoritative_tutorial_chest' }
+            );
+        }
+        return true;
+    }
+
+    /**
+     * The gold chest behind a Legends' Inn stage boss.
+     *
+     * Nothing about this payout is a roll, so the loot tables are stepped over
+     * entirely: everyone standing in the instance is handed the stage's gold on the
+     * floor, plus whichever of the three catalysts they have not already taken
+     * this week. See `core/LegendsInnChest.ts` for the rules, for how the gold
+     * scales, and for why the catalysts ride down on carrier materials.
+     *
+     * The opening is claimed per level scope so that the report from whichever
+     * client landed the killing blow pays the instance exactly once - and so that
+     * a second player's report of the same chest is a no-op rather than a second
+     * million.
+     *
+     * Returns true when the reward request was this feature's to answer.
+     */
+    private static handleLegendsInnStageChestReward(
+        client: Client,
+        sourceEntity: any,
+        dropPosition: { x: number; y: number }
+    ): boolean {
+        if (!LegendsInnChest.isStageChest(client.currentLevel, sourceEntity, dropPosition)) {
+            return false;
+        }
+
+        const levelScope = getClientLevelScope(client);
+        const chestKey = `${Math.max(0, Math.round(Number(sourceEntity?.id ?? 0)))}:${Math.round(dropPosition.x)}:${Math.round(dropPosition.y)}`;
+        if (!claimChestOpening(levelScope, chestKey)) {
+            return true;
+        }
+
+        for (const recipient of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!recipient.playerSpawned || !recipient.character || getClientLevelScope(recipient) !== levelScope) {
+                continue;
+            }
+
+            const payout = LegendsInnChest.takePayout(recipient);
+            payout.forEach((entry, index) => {
+                const reward: LootReward = entry.consumableId
+                    ? { material: entry.carrierMaterialId, consumable: entry.consumableId }
+                    : { gold: entry.gold };
+                // Fanned out along the floor so a stack of four pickups does not
+                // land on one point and read as a single drop.
+                RewardHandler.spawnLoot(recipient, dropPosition.x, dropPosition.y, reward, (index - 1) * 70, 0, {
+                    reason: 'chest_reward',
+                    caller: 'legends_inn_stage_chest'
+                });
+            });
+
+            console.log(
+                `[LegendsInn] chest ${chestKey} paid ${String(recipient.character?.name ?? '')}: ` +
+                payout.map((entry) => entry.label).join(', ')
+            );
+            RewardHandler.persistCharacter(recipient, "legends' inn chest");
+        }
+        return true;
+    }
+
+    /**
+     * One of the borrowed dungeon's own chests, standing in a Legends' Inn stage.
+     *
+     * These were the chests that "gave nothing": they are authored props with
+     * authored loot tables, and most of those tables roll no gold at all at this
+     * tier. In here they pay a share of the stage's gold instead - on the floor,
+     * to everyone in the instance, exactly the way the boss chest does - so every
+     * chest in the run is worth the detour.
+     *
+     * Claimed per opening per scope for the same reason the boss chest is: the
+     * report comes from whichever client broke it and the whole instance is paid.
+     *
+     * Returns true when the reward request was this feature's to answer.
+     */
+    private static handleLegendsInnSideChestReward(
+        client: Client,
+        sourceEntity: any,
+        dropPosition: { x: number; y: number }
+    ): boolean {
+        if (!LegendsInnChest.isSideChest(client.currentLevel, sourceEntity, dropPosition)) {
+            return false;
+        }
+
+        const levelScope = getClientLevelScope(client);
+        const chestKey = `side:${Math.max(0, Math.round(Number(sourceEntity?.id ?? 0)))}:${Math.round(dropPosition.x)}:${Math.round(dropPosition.y)}`;
+        if (!claimChestOpening(levelScope, chestKey)) {
+            return true;
+        }
+
+        for (const recipient of GlobalState.getSessionsInLevelScope(levelScope)) {
+            if (!recipient.playerSpawned || !recipient.character || getClientLevelScope(recipient) !== levelScope) {
+                continue;
+            }
+
+            const payout = LegendsInnChest.takeSidePayout(recipient);
+            RewardHandler.spawnLoot(recipient, dropPosition.x, dropPosition.y, { gold: payout.gold }, 0, 0, {
+                reason: 'chest_reward',
+                caller: 'legends_inn_side_chest'
+            });
+            console.log(
+                `[LegendsInn] side chest ${chestKey} paid ${String(recipient.character?.name ?? '')}: ${payout.label}`
+            );
+        }
+        return true;
     }
 
     static handleGrantReward(client: Client, data: Buffer): void {
@@ -975,15 +1453,153 @@ export class RewardHandler {
 
         const sourceEntity = RewardHandler.resolveSourceEntity(client, reward.sourceId);
         const dropPosition = RewardHandler.resolveDropPosition(client, sourceEntity, reward.worldX, reward.worldY);
+        if (RewardHandler.handleAuthoritativeTutorialChestReward(client, reward, sourceEntity, dropPosition)) {
+            return;
+        }
+        if (RewardHandler.handleLegendsInnStageChestReward(client, sourceEntity, dropPosition)) {
+            return;
+        }
+        if (RewardHandler.handleLegendsInnSideChestReward(client, sourceEntity, dropPosition)) {
+            return;
+        }
         const { rewardNonce, recipients } = RewardHandler.resolveEligibleRecipients(client, reward.sourceId);
+        const reason = RewardHandler.getRewardSourceReason(sourceEntity);
+        const caller = 'handleGrantReward';
+        const levelScope = getClientLevelScope(client);
+        if (!sourceEntity || reason === 'unknown') {
+            return;
+        }
+        if (
+            RewardHandler.requiresCanonicalHostileLootContext(client.currentLevel, sourceEntity) &&
+            reason === 'legacy_enemy_reward'
+        ) {
+            return;
+        }
 
         for (const recipient of recipients) {
             if (!recipient.playerSpawned || !areClientsInSameLevelScope(client, recipient)) {
                 continue;
             }
 
-            RewardHandler.applyRewardToRecipient(recipient, reward, rewardNonce, sourceEntity, dropPosition);
+            RewardHandler.applyRewardToRecipient(recipient, reward, rewardNonce, sourceEntity, dropPosition, {
+                reason,
+                caller
+            });
         }
+    }
+
+    private static resolveServerEnemyRewardViewers(client: Client, levelScope: string): Client[] {
+        const partyId = getPartyIdForClient(client);
+        if (partyId <= 0) {
+            return client.character && client.playerSpawned && getClientLevelScope(client) === levelScope ? [client] : [];
+        }
+
+        const recipients: Client[] = [];
+        for (const other of GlobalState.getSessionsInParty(partyId)) {
+            if (
+                !other.playerSpawned ||
+                !other.character ||
+                getClientLevelScope(other) !== levelScope ||
+                getPartyIdForClient(other) !== partyId
+            ) {
+                continue;
+            }
+            recipients.push(other);
+        }
+
+        return recipients;
+    }
+
+    static grantServerEnemyRewardToEligibleViewers(
+        client: Client,
+        sourceEntity: any,
+        options: { levelScope?: string; lootDropNonce?: string | number; sourceEnemyCanonicalId?: number; caller?: string } = {}
+    ): void {
+        if (
+            !client.character ||
+            !client.currentLevel ||
+            !sourceEntity ||
+            sourceEntity.isPlayer ||
+            Number(sourceEntity.team ?? 0) !== 2
+        ) {
+            return;
+        }
+
+        const sourceId = Math.max(0, Math.round(Number(sourceEntity.id ?? 0)));
+        const entName = String(sourceEntity.name ?? sourceEntity.EntName ?? sourceEntity.entName ?? '').trim();
+        if (sourceId <= 0 || !entName) {
+            return;
+        }
+
+        const levelScope = String(options.levelScope ?? getClientLevelScope(client));
+        const sourceEnemyCanonicalId = Math.max(0, Math.round(Number(options.sourceEnemyCanonicalId ?? 0)));
+        const sourceLootDropNonce = String(options.lootDropNonce ?? '');
+        const caller = String(options.caller ?? 'grantServerEnemyRewardToEligibleViewers');
+        if (
+            RewardHandler.requiresCanonicalHostileLootContext(
+                getScopeLevelName(levelScope),
+                sourceEntity,
+                sourceEnemyCanonicalId
+            ) &&
+            (
+                sourceEnemyCanonicalId !== sourceId ||
+                !RewardHandler.isCanonicalDeathLootContextValid(levelScope, sourceEnemyCanonicalId, sourceLootDropNonce)
+            )
+        ) {
+            return;
+        }
+        const entType = GameData.getEntType(entName) ?? {};
+        const entLevel = Math.max(
+            1,
+            Math.round(Number(sourceEntity.level ?? entType.Level ?? client.character.level ?? 1) || 1)
+        );
+        const entRank = String(entType.EntRank ?? sourceEntity.entRank ?? sourceEntity.EntRank ?? 'Minion').trim();
+        const maxHp = Math.max(100, Math.round(Number(client.authoritativeMaxHp ?? sourceEntity.maxHp ?? 100) || 100));
+        const reward: RewardRequest = {
+            receiverId: Math.max(0, Math.round(Number(client.clientEntID ?? 0))),
+            sourceId,
+            dropItem: true,
+            itemMultiplier: 1,
+            dropGear: true,
+            gearMultiplier: 1,
+            dropMaterial: true,
+            dropTrove: false,
+            exp: GameData.calculateNpcExp(entName, entLevel),
+            petExp: 0,
+            hpGain: entRank === 'Boss' || entRank === 'MiniBoss'
+                ? Math.max(1, Math.floor(maxHp * 0.15))
+                : 0,
+            gold: GameData.calculateNpcGold(entName, entLevel),
+            worldX: Math.round(Number(sourceEntity.x ?? sourceEntity.pos_x ?? 0) || 0),
+            worldY: Math.round(Number(sourceEntity.y ?? sourceEntity.pos_y ?? 0) || 0),
+            combo: 0
+        };
+        const dropPosition = RewardHandler.resolveDropPosition(client, sourceEntity, reward.worldX, reward.worldY);
+        const recipients = RewardHandler.resolveServerEnemyRewardViewers(client, levelScope);
+        sourceEntity.lootGrantedTokens = RewardHandler.normalizeNumberSet(sourceEntity.lootGrantedTokens);
+
+        for (const recipient of recipients) {
+            if (!recipient.playerSpawned || getClientLevelScope(recipient) !== levelScope) {
+                continue;
+            }
+            if (sourceEntity.lootGrantedTokens.has(recipient.token)) {
+                continue;
+            }
+
+            sourceEntity.lootGrantedTokens.add(recipient.token);
+            RewardHandler.applyRewardToRecipient(recipient, reward, sourceLootDropNonce, sourceEntity, dropPosition, {
+                sourceLootDropNonce,
+                sourceEnemyCanonicalId: sourceId,
+                reason: 'canonical_hostile_death',
+                caller
+            });
+        }
+    }
+
+    static grantServerEnemyReward(client: Client, sourceEntity: any): void {
+        RewardHandler.grantServerEnemyRewardToEligibleViewers(client, sourceEntity, {
+            caller: 'grantServerEnemyReward'
+        });
     }
 
     static handlePickupLootdrop(client: Client, data: Buffer): void {
@@ -994,27 +1610,57 @@ export class RewardHandler {
             return;
         }
 
+        const metadata = reward.__lootDropMetadata;
+        if (metadata) {
+            if (metadata.ownerToken > 0 && metadata.ownerToken !== client.token) {
+                client.pendingLoot.delete(lootId);
+                return;
+            }
+
+            const sourceEntity = RewardHandler.getCanonicalLootSource(metadata);
+            const collectedTokens = sourceEntity && typeof sourceEntity === 'object'
+                ? RewardHandler.normalizeStringSet(sourceEntity.lootCollectedTokens)
+                : new Set<string>();
+            const collectKey = metadata.ownerToken > 0
+                ? `${metadata.lootDropNonce}:${client.token}`
+                : metadata.lootDropNonce;
+            if (metadata.collected || collectedTokens.has(collectKey)) {
+                client.pendingLoot.delete(lootId);
+                return;
+            }
+
+            metadata.collected = true;
+            metadata.collectedBy = client.token;
+            collectedTokens.add(collectKey);
+            if (sourceEntity && typeof sourceEntity === 'object') {
+                sourceEntity.lootCollectedTokens = collectedTokens;
+            }
+        } else {
+        }
+
         client.pendingLoot.delete(lootId);
 
         let shouldSave = false;
 
-        if (reward.gold && reward.gold > 0) {
-            client.character.gold = Number(client.character.gold ?? 0) + reward.gold;
-            noteDungeonRunTreasure(client, reward.gold);
-            RewardHandler.sendGoldReward(client, reward.gold, false);
+        if (RewardHandler.grantGoldLoot(client, Number(reward.gold ?? 0))) {
             shouldSave = true;
         }
 
-        if (reward.material && reward.material > 0) {
-            const materials = normalizeCharacterMaterials(client.character);
-            const existing = materials.find((entry: any) => Number(entry.materialID ?? 0) === reward.material);
-            if (existing) {
-                existing.count = Number(existing.count ?? 0) + 1;
-            } else {
-                materials.push({ materialID: reward.material, count: 1 });
-            }
-            client.character.materials = materials;
-            RewardHandler.sendMaterialReward(client, reward.material, 1);
+        // A catalyst rides down on a carrier material, and *both* are granted.
+        //
+        // The carrier used to be dropped on the floor and then thrown away on
+        // pickup, on the grounds that it was only ever a drawing. From the other
+        // side of the screen that reads as a bug and was reported as one: the
+        // player walks over a material, no material notification appears, and the
+        // bag has no new material in it - because the only thing that landed was a
+        // consumable, and a consumable count update (0x10C) is silent. Paying the
+        // material the player actually saw fixes both halves at once, and the
+        // catalyst still arrives underneath it.
+        const consumableId = Math.max(0, Math.round(Number(reward.consumable ?? 0)));
+        if (consumableId > 0 && RewardHandler.grantConsumableLoot(client, consumableId)) {
+            shouldSave = true;
+        }
+        if (RewardHandler.grantMaterialLoot(client, Number(reward.material ?? 0))) {
             shouldSave = true;
         }
 
